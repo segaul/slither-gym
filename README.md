@@ -10,6 +10,10 @@
 
 A high-performance, Gymnasium/PettingZoo-compatible reinforcement learning environment that faithfully recreates the mechanics of [Slither.io](http://slither.io) — continuous control, variable-length agents, partial observability, and emergent multi-agent dynamics.
 
+<p align="center">
+  <img src="docs/demo.gif" alt="AI agent playing slither-gym" width="720">
+</p>
+
 ## Why slither-gym?
 
 Most multi-agent RL environments are either too simple (grid worlds, particle envs) or too expensive (3D simulators). Slither.io sits in a sweet spot:
