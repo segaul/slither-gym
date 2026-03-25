@@ -113,6 +113,7 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
 
         total_reward = 0.0
         terminated = False
+        last_step_result = None
 
         for _ in range(config.step_mul):
             world_actions: dict[int, tuple[float, float, bool]] = {0: (cos_a, sin_a, boost)}
@@ -123,6 +124,7 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
 
             if 0 in results:
                 result = results[0]
+                last_step_result = result
                 snake_state = self._world.get_snake_states().get(0)
                 if snake_state is not None:
                     reward = compute_reward(result, snake_state, config)
@@ -153,6 +155,12 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         rl_state = self._world.get_snake_states().get(0)
         if rl_state is not None:
             info["mass"] = rl_state.mass
+            info["snake_state"] = rl_state
+
+        # Expose StepResult and WorldConfig for external reward computation
+        if last_step_result is not None:
+            info["step_result"] = last_step_result
+        info["world_config"] = self._world_config
 
         return rl_obs, total_reward, terminated, truncated, info
 
