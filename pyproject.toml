@@ -1,0 +1,33 @@
+[project]
+name = "slither-gym"
+version = "0.1.0"
+description = "Gymnasium/PettingZoo-compatible Slither.io training environment for RL"
+readme = "README.md"
+authors = [
+    { name = "segaul", email = "esegaul@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "gymnasium",
+    "pettingzoo",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "mypy",
+    "pygame",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.17,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.mypy]
+strict = true
+plugins = []
+
+[[tool.mypy.overrides]]
+module = ["pettingzoo", "pettingzoo.*"]
+ignore_missing_imports = true
