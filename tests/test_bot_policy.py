@@ -21,7 +21,7 @@ def _make_obs(
     self_state = np.array([
         0.0, 0.0,
         math.cos(heading_angle), math.sin(heading_angle),
-        0.0, 3.0,
+        0.0, 3.0, 0.0, 0.0,
     ], dtype=np.float32)
 
     return {"self_state": self_state, "food": food, "enemies": enemies}
@@ -51,11 +51,9 @@ def test_flee_danger() -> None:
     obs_config = ObsConfig()
     enemies = np.zeros((obs_config.k_enemies, obs_config.enemy_features), dtype=np.float32)
     # Enemy head very close, directly ahead
-    enemies[0, 0] = 0.1   # rel_x
-    enemies[0, 1] = 0.0   # rel_y
-    enemies[0, 2] = 1.0   # is_head
-    enemies[0, 3] = 1.0   # mass
-    enemies[0, 4] = 3.0   # speed
+    enemies[0, 0] = 0.1    # head_dx
+    enemies[0, 1] = 0.0    # head_dy
+    enemies[0, 31] = 1.0   # is_active
 
     obs = _make_obs(enemies=enemies)
     action = bot.act(obs)

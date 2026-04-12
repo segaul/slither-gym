@@ -3,6 +3,8 @@ import math
 import numpy as np
 from numpy.typing import NDArray
 
+from typing import Any
+
 from slither_gym.core.types import WorldConfig
 
 
@@ -17,7 +19,7 @@ class BotPolicy:
         self._rng = rng
         self._danger_distance = 0.2
 
-    def act(self, obs: dict[str, NDArray[np.float32]]) -> NDArray[np.float32]:
+    def act(self, obs: dict[str, NDArray[np.float32]], **kwargs: Any) -> NDArray[np.float32]:
         self_state = obs["self_state"]
         enemies = obs["enemies"]
         food = obs["food"]
@@ -33,8 +35,9 @@ class BotPolicy:
         closest_head_x = 0.0
         closest_head_y = 0.0
 
+        # enemies is (16, 32): index 31 = is_active, 0-1 = head_dx/dy
         for i in range(enemies.shape[0]):
-            if enemies[i, 2] > 0.5:
+            if enemies[i, 31] > 0.5:  # is_active
                 ex = float(enemies[i, 0])
                 ey = float(enemies[i, 1])
                 dist = math.sqrt(ex * ex + ey * ey)

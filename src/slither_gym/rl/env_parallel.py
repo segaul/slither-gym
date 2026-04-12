@@ -13,7 +13,7 @@ from slither_gym.core.types import WorldConfig
 from slither_gym.core.world import World
 from slither_gym.rl.obs_processor import compute_observation
 from slither_gym.rl.reward import compute_reward
-from slither_gym.rl.types import AgentId, ObsConfig, RawGameState
+from slither_gym.rl.types import AgentId, EnemySnakeInfo, ObsConfig, RawGameState
 
 
 class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
@@ -143,16 +143,31 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
         obs_config = self._obs_config
         return gymnasium.spaces.Dict({
             "self_state": gymnasium.spaces.Box(
-                low=-np.inf, high=np.inf, shape=(6,), dtype=np.float32,
+                low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32,
             ),
             "food": gymnasium.spaces.Box(
                 low=-np.inf, high=np.inf,
                 shape=(obs_config.k_food, obs_config.food_features),
                 dtype=np.float32,
             ),
+            "prey": gymnasium.spaces.Box(
+                low=-np.inf, high=np.inf,
+                shape=(obs_config.k_prey, obs_config.prey_features),
+                dtype=np.float32,
+            ),
             "enemies": gymnasium.spaces.Box(
                 low=-np.inf, high=np.inf,
                 shape=(obs_config.k_enemies, obs_config.enemy_features),
+                dtype=np.float32,
+            ),
+            "danger_segments": gymnasium.spaces.Box(
+                low=-np.inf, high=np.inf,
+                shape=(obs_config.k_danger_segments, obs_config.danger_features),
+                dtype=np.float32,
+            ),
+            "own_body": gymnasium.spaces.Box(
+                low=-np.inf, high=np.inf,
+                shape=(obs_config.k_own_body, obs_config.own_body_features),
                 dtype=np.float32,
             ),
             "minimap": gymnasium.spaces.Box(
@@ -177,6 +192,7 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
         states = self._world.get_snake_states()
         food_pos = self._world.get_food_positions()
         food_vals = self._world.get_food_values()
+        food_corpse = self._world.get_food_is_corpse()
 
         # Build minimap data (shared across all agents)
         alive_states = [s for s in states.values() if s.alive]
@@ -195,11 +211,8 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
             state = states[snake_idx]
 
             enemy_segs_list: list[NDArray[np.float32]] = []
-            enemy_is_head_list: list[bool] = []
-            enemy_mass_list: list[float] = []
-            enemy_speed_list: list[float] = []
-            enemy_angle_list: list[float] = []
             enemy_radius_list: list[float] = []
+            enemy_snakes_list: list[EnemySnakeInfo] = []
 
             for other_idx, other_state in states.items():
                 if other_idx == snake_idx or not other_state.alive:
@@ -208,27 +221,27 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
                 if len(segs) == 0:
                     continue
                 enemy_segs_list.append(segs)
-                n_segs = len(segs)
-                enemy_is_head_list.extend([True] + [False] * (n_segs - 1))
-                enemy_mass_list.extend([other_state.mass] * n_segs)
-                enemy_speed_list.extend([other_state.speed] * n_segs)
-                enemy_angle_list.extend([other_state.angle] * n_segs)
-                enemy_radius_list.extend([other_state.segment_radius] * n_segs)
+                enemy_radius_list.extend([other_state.segment_radius] * len(segs))
+                enemy_snakes_list.append(EnemySnakeInfo(
+                    snake_id=other_idx,
+                    head_x=other_state.head_x,
+                    head_y=other_state.head_y,
+                    mass=other_state.mass,
+                    speed=other_state.speed,
+                    angle=other_state.angle,
+                    boosting=other_state.boosting,
+                    segments=segs,
+                ))
 
             if enemy_segs_list:
                 all_enemy_segs = np.concatenate(enemy_segs_list, axis=0)
-                all_is_head = np.array(enemy_is_head_list, dtype=np.bool_)
-                all_mass = np.array(enemy_mass_list, dtype=np.float32)
-                all_speed = np.array(enemy_speed_list, dtype=np.float32)
-                all_angle = np.array(enemy_angle_list, dtype=np.float32)
                 all_radius = np.array(enemy_radius_list, dtype=np.float32)
             else:
                 all_enemy_segs = np.zeros((0, 2), dtype=np.float32)
-                all_is_head = np.zeros(0, dtype=np.bool_)
-                all_mass = np.zeros(0, dtype=np.float32)
-                all_speed = np.zeros(0, dtype=np.float32)
-                all_angle = np.zeros(0, dtype=np.float32)
                 all_radius = np.zeros(0, dtype=np.float32)
+
+            own_segs = self._world.get_segments(snake_idx)
+            n_flat = len(all_enemy_segs)
 
             raw = RawGameState(
                 self_x=state.head_x,
@@ -236,17 +249,22 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
                 self_mass=state.mass,
                 self_speed=state.speed,
                 self_angle=state.angle,
+                self_segment_count=state.segment_count,
+                self_boosting=state.boosting,
                 food_positions=food_pos,
                 food_values=food_vals,
+                food_is_corpse=food_corpse,
+                own_segments=own_segs,
                 enemy_segments=all_enemy_segs,
-                enemy_is_head=all_is_head,
-                enemy_owner_mass=all_mass,
-                enemy_owner_speed=all_speed,
-                enemy_owner_angle=all_angle,
+                enemy_is_head=np.zeros(n_flat, dtype=np.bool_),
+                enemy_owner_mass=np.zeros(n_flat, dtype=np.float32),
+                enemy_owner_speed=np.zeros(n_flat, dtype=np.float32),
+                enemy_owner_angle=np.zeros(n_flat, dtype=np.float32),
                 enemy_segment_radius=all_radius,
                 all_snake_positions=all_positions,
                 all_snake_masses=all_masses,
                 map_radius=self._world_config.map_radius,
+                enemy_snakes=tuple(enemy_snakes_list),
             )
 
             observations[agent_id] = compute_observation(raw, self._obs_config)
@@ -256,8 +274,11 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
     def _empty_obs(self) -> dict[str, NDArray[np.float32]]:
         obs_config = self._obs_config
         return {
-            "self_state": np.zeros(6, dtype=np.float32),
+            "self_state": np.zeros(8, dtype=np.float32),
             "food": np.zeros((obs_config.k_food, obs_config.food_features), dtype=np.float32),
+            "prey": np.zeros((obs_config.k_prey, obs_config.prey_features), dtype=np.float32),
             "enemies": np.zeros((obs_config.k_enemies, obs_config.enemy_features), dtype=np.float32),
+            "danger_segments": np.zeros((obs_config.k_danger_segments, obs_config.danger_features), dtype=np.float32),
+            "own_body": np.zeros((obs_config.k_own_body, obs_config.own_body_features), dtype=np.float32),
             "minimap": np.zeros((obs_config.minimap_size, obs_config.minimap_size), dtype=np.float32),
         }

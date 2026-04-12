@@ -13,7 +13,8 @@ from slither_gym.rl.bot_policy import BotPolicy
 from slither_gym.rl.env_parallel import SlitherParallelEnv
 from slither_gym.rl.obs_processor import compute_observation
 from slither_gym.rl.reward import compute_reward
-from slither_gym.rl.types import AgentId, ObsConfig, RawGameState
+from slither_gym.rl.snake_cache import SnakeCache
+from slither_gym.rl.types import AgentId, EnemySnakeInfo, ObsConfig, RawGameState
 
 
 class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
@@ -33,6 +34,7 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         seed: int = 0,
         render_mode: str | None = None,
         respawn_bots: bool = True,
+        bot_policies: dict[int, Any] | None = None,
     ) -> None:
         super().__init__()
         self._world_config = world_config
@@ -46,6 +48,7 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         self._world: World | None = None
         self._rng = np.random.default_rng(seed)
         self._bot_policy = BotPolicy(world_config, self._rng)
+        self._bot_policies: dict[int, Any] = bot_policies or {}
         self._rl_agent_id: AgentId = "snake_0"
         self._tick_count: int = 0
         self._obs_update_counter: int = 0
@@ -61,6 +64,7 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         self.observation_space = self._parallel_env.observation_space(self._rl_agent_id)
         self.action_space = self._parallel_env.action_space(self._rl_agent_id)
 
+        self._snake_cache = SnakeCache(max_slots=obs_config.k_enemies)
         self._bot_obs_cache: dict[int, dict[str, NDArray[np.float32]]] = {}
 
     def reset(
@@ -76,6 +80,7 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
 
         self._world = World(self._world_config, seed=self._seed)
         self._tick_count = 0
+        self._snake_cache.reset()
 
         for i in range(1 + self._num_bots):
             self._world.spawn_snake(i)
@@ -106,7 +111,8 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             state = self._world.get_snake_states().get(i)
             if state is not None and state.alive:
                 if i in self._bot_obs_cache:
-                    bot_act = self._bot_policy.act(self._bot_obs_cache[i])
+                    policy = self._bot_policies.get(i, self._bot_policy)
+                    bot_act = policy.act(self._bot_obs_cache[i], snake_id=i)
                     bot_actions[i] = (float(bot_act[0]), float(bot_act[1]), bool(bot_act[2] > 0.5))
                 else:
                     bot_actions[i] = (math.cos(state.angle), math.sin(state.angle), False)
@@ -140,6 +146,9 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
                 state = self._world.get_snake_states().get(i)
                 if state is None or not state.alive:
                     self._world.spawn_snake(i)
+                    # Reset stateful policies on respawn
+                    if i in self._bot_policies and hasattr(self._bot_policies[i], 'reset'):
+                        self._bot_policies[i].reset(i)
 
         if terminated:
             rl_obs = self._empty_obs()
@@ -174,7 +183,14 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         food_pos = self._world.get_food_positions()
         food_vals = self._world.get_food_values()
         raw = self._build_raw_state(0, rl_state, states, food_pos, food_vals)
-        return compute_observation(raw, self._obs_config)
+
+        # Update snake cache and get slot mapping for RL agent
+        visible = {info.snake_id: info for info in raw.enemy_snakes}
+        slot_mapping = self._snake_cache.update(
+            visible, rl_state.head_x, rl_state.head_y,
+            self._world_config.perception_radius,
+        )
+        return compute_observation(raw, self._obs_config, snake_slot_mapping=slot_mapping)
 
     def _update_bot_obs_cache(self) -> None:
         assert self._world is not None
@@ -182,12 +198,13 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         states = self._world.get_snake_states()
         food_pos = self._world.get_food_positions()
         food_vals = self._world.get_food_values()
+        food_corpse = self._world.get_food_is_corpse()
 
         for i in range(1, 1 + self._num_bots):
             bot_state = states.get(i)
             if bot_state is None or not bot_state.alive:
                 continue
-            raw = self._build_raw_state(i, bot_state, states, food_pos, food_vals)
+            raw = self._build_raw_state(i, bot_state, states, food_pos, food_vals, food_corpse)
             self._bot_obs_cache[i] = compute_observation(raw, self._obs_config)
 
     def _build_raw_state(
@@ -197,19 +214,22 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         all_states: dict[int, Any],
         food_pos: NDArray[np.float32] | None = None,
         food_vals: NDArray[np.float32] | None = None,
+        food_is_corpse: NDArray[np.bool_] | None = None,
     ) -> RawGameState:
         assert self._world is not None
         if food_pos is None:
             food_pos = self._world.get_food_positions()
         if food_vals is None:
             food_vals = self._world.get_food_values()
+        if food_is_corpse is None:
+            food_is_corpse = self._world.get_food_is_corpse()
+
+        # Own body segments
+        own_segs = self._world.get_segments(snake_id)
 
         enemy_segs_list: list[NDArray[np.float32]] = []
-        enemy_is_head_list: list[bool] = []
-        enemy_mass_list: list[float] = []
-        enemy_speed_list: list[float] = []
-        enemy_angle_list: list[float] = []
         enemy_radius_list: list[float] = []
+        enemy_snakes_list: list[EnemySnakeInfo] = []
 
         # Also collect all snake positions for minimap
         all_positions_list: list[list[float]] = []
@@ -232,28 +252,28 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             if dx * dx + dy * dy > (self._world_config.perception_radius + 300) ** 2:
                 continue
 
+            # Flat segments for danger_segments
             enemy_segs_list.append(segs)
             n = len(segs)
-            enemy_is_head_list.append(True)
-            enemy_is_head_list.extend([False] * (n - 1))
-            enemy_mass_list.extend([other_state.mass] * n)
-            enemy_speed_list.extend([other_state.speed] * n)
-            enemy_angle_list.extend([other_state.angle] * n)
             enemy_radius_list.extend([other_state.segment_radius] * n)
+
+            # Per-snake structured data for enemies channel
+            enemy_snakes_list.append(EnemySnakeInfo(
+                snake_id=other_id,
+                head_x=other_state.head_x,
+                head_y=other_state.head_y,
+                mass=other_state.mass,
+                speed=other_state.speed,
+                angle=other_state.angle,
+                boosting=other_state.boosting,
+                segments=segs,
+            ))
 
         if enemy_segs_list:
             all_enemy_segs: NDArray[np.float32] = np.concatenate(enemy_segs_list, axis=0)
-            all_is_head = np.array(enemy_is_head_list, dtype=np.bool_)
-            all_mass = np.array(enemy_mass_list, dtype=np.float32)
-            all_speed = np.array(enemy_speed_list, dtype=np.float32)
-            all_angle = np.array(enemy_angle_list, dtype=np.float32)
             all_radius = np.array(enemy_radius_list, dtype=np.float32)
         else:
             all_enemy_segs = np.zeros((0, 2), dtype=np.float32)
-            all_is_head = np.zeros(0, dtype=np.bool_)
-            all_mass = np.zeros(0, dtype=np.float32)
-            all_speed = np.zeros(0, dtype=np.float32)
-            all_angle = np.zeros(0, dtype=np.float32)
             all_radius = np.zeros(0, dtype=np.float32)
 
         if all_positions_list:
@@ -263,30 +283,44 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             all_positions = np.zeros((0, 2), dtype=np.float32)
             all_masses = np.zeros(0, dtype=np.float32)
 
+        # Dummy arrays for legacy flat fields still needed by danger_segments
+        n_flat = len(all_enemy_segs)
         return RawGameState(
             self_x=state.head_x,
             self_y=state.head_y,
             self_mass=state.mass,
             self_speed=state.speed,
             self_angle=state.angle,
+            self_segment_count=state.segment_count,
+            self_boosting=state.boosting,
             food_positions=food_pos,
             food_values=food_vals,
+            food_is_corpse=food_is_corpse,
+            own_segments=own_segs,
             enemy_segments=all_enemy_segs,
-            enemy_is_head=all_is_head,
-            enemy_owner_mass=all_mass,
-            enemy_owner_speed=all_speed,
-            enemy_owner_angle=all_angle,
+            enemy_is_head=np.zeros(n_flat, dtype=np.bool_),
+            enemy_owner_mass=np.zeros(n_flat, dtype=np.float32),
+            enemy_owner_speed=np.zeros(n_flat, dtype=np.float32),
+            enemy_owner_angle=np.zeros(n_flat, dtype=np.float32),
             enemy_segment_radius=all_radius,
             all_snake_positions=all_positions,
             all_snake_masses=all_masses,
             map_radius=self._world_config.map_radius,
+            enemy_snakes=tuple(enemy_snakes_list),
         )
+
+    def set_bot_policies(self, policies: dict[int, Any]) -> None:
+        """Swap bot policies at runtime. Called by training loop for self-play."""
+        self._bot_policies = policies
 
     def _empty_obs(self) -> dict[str, NDArray[np.float32]]:
         obs_config = self._obs_config
         return {
-            "self_state": np.zeros(6, dtype=np.float32),
+            "self_state": np.zeros(8, dtype=np.float32),
             "food": np.zeros((obs_config.k_food, obs_config.food_features), dtype=np.float32),
+            "prey": np.zeros((obs_config.k_prey, obs_config.prey_features), dtype=np.float32),
             "enemies": np.zeros((obs_config.k_enemies, obs_config.enemy_features), dtype=np.float32),
+            "danger_segments": np.zeros((obs_config.k_danger_segments, obs_config.danger_features), dtype=np.float32),
+            "own_body": np.zeros((obs_config.k_own_body, obs_config.own_body_features), dtype=np.float32),
             "minimap": np.zeros((obs_config.minimap_size, obs_config.minimap_size), dtype=np.float32),
         }

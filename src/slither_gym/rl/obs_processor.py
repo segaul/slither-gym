@@ -10,14 +10,19 @@ from slither_gym.rl.types import ObsConfig, RawGameState
 def compute_observation(
     state: RawGameState,
     obs_config: ObsConfig,
+    snake_slot_mapping: dict[int, int] | None = None,
 ) -> dict[str, NDArray[np.float32]]:
     """
     Pure function. Same input always produces same output.
-    Returns {"self_state": (6,), "food": (K_f, 3), "enemies": (K_e, 7), "minimap": (N, N)}.
+    Returns {"self_state": (8,), "food": (K_f, 3), "prey": (K_p, 3),
+             "enemies": (K_e, 32), "danger_segments": (K_d, 3),
+             "own_body": (K_b, 2), "minimap": (N, N)}.
     """
-    initial_mass = 10.0  # WorldConfig default
+    initial_mass = 10.0
+    max_segments = 256  # WorldConfig default
+    perception_radius = 500.0
 
-    # 1. Self state
+    # 1. Self state (8)
     self_state = np.array([
         state.self_x / state.map_radius,
         state.self_y / state.map_radius,
@@ -25,83 +30,28 @@ def compute_observation(
         math.sin(state.self_angle),
         math.log(state.self_mass / initial_mass),
         state.self_speed,
+        state.self_segment_count / max_segments,
+        1.0 if state.self_boosting else 0.0,
     ], dtype=np.float32)
 
-    perception_radius = 500.0  # WorldConfig default
+    # 2. Food observation (floor food only — corpse food goes to prey)
+    food_obs = _compute_food(state, obs_config.k_food, perception_radius, corpse=False)
 
-    # 2. Food observation
-    k_food = obs_config.k_food
-    food_obs = np.zeros((k_food, obs_config.food_features), dtype=np.float32)
+    # 3. Prey observation (corpse food only)
+    prey_obs = _compute_food(state, obs_config.k_prey, perception_radius, corpse=True)
 
-    if len(state.food_positions) > 0:
-        rel_food = state.food_positions - np.array([state.self_x, state.self_y], dtype=np.float32)
-        food_dists = np.sqrt(np.sum(rel_food * rel_food, axis=1))
+    # 4. Enemies observation — per-snake tracked (16, 32)
+    enemy_obs = _compute_enemies(
+        state, obs_config, perception_radius, initial_mass, snake_slot_mapping,
+    )
 
-        within = food_dists < perception_radius
-        if np.any(within):
-            rel_food_in = rel_food[within]
-            food_dists_in = food_dists[within]
-            food_vals_in = state.food_values[within]
+    # 5. Danger segments — collision avoidance radar (64, 3)
+    danger_obs = _compute_danger_segments(state, obs_config, perception_radius)
 
-            order = np.argsort(food_dists_in)
-            n_take = min(len(order), k_food)
-            order = order[:n_take]
+    # 6. Own body observation
+    own_body_obs = _compute_own_body(state, obs_config, perception_radius)
 
-            food_obs[:n_take, 0] = rel_food_in[order, 0] / perception_radius
-            food_obs[:n_take, 1] = rel_food_in[order, 1] / perception_radius
-            food_obs[:n_take, 2] = food_vals_in[order]
-
-    # 3. Enemy observation with priority filtering
-    k_enemies = obs_config.k_enemies
-    enemy_obs = np.zeros((k_enemies, obs_config.enemy_features), dtype=np.float32)
-
-    if len(state.enemy_segments) > 0:
-        rel_enemy = state.enemy_segments - np.array([state.self_x, state.self_y], dtype=np.float32)
-        enemy_dists = np.sqrt(np.sum(rel_enemy * rel_enemy, axis=1))
-
-        within = enemy_dists < perception_radius
-        if np.any(within):
-            rel_in = rel_enemy[within]
-            dists_in = enemy_dists[within]
-            is_head_in = state.enemy_is_head[within]
-            mass_in = state.enemy_owner_mass[within]
-            speed_in = state.enemy_owner_speed[within]
-            angle_in = state.enemy_owner_angle[within]
-            radius_in = state.enemy_segment_radius[within]
-
-            head_mask = is_head_in
-            body_mask = ~is_head_in
-
-            head_indices = np.where(head_mask)[0]
-            body_indices = np.where(body_mask)[0]
-
-            head_order = head_indices[np.argsort(dists_in[head_indices])] if len(head_indices) > 0 else np.array([], dtype=np.intp)
-            body_order = body_indices[np.argsort(dists_in[body_indices])] if len(body_indices) > 0 else np.array([], dtype=np.intp)
-
-            priority_order = np.concatenate([head_order, body_order])[:k_enemies]
-            n_take = len(priority_order)
-
-            sel = priority_order[:n_take]
-            sel_rel = rel_in[sel]
-            sel_angle = angle_in[sel]
-            sel_mass = mass_in[sel]
-            sel_speed = speed_in[sel]
-            sel_is_head = is_head_in[sel]
-            sel_radius = radius_in[sel]
-
-            vec_to_self_angle = np.arctan2(-sel_rel[:, 1], -sel_rel[:, 0])
-            rel_vel_diff = vec_to_self_angle - sel_angle
-            rel_vel_angle = np.arctan2(np.sin(rel_vel_diff), np.cos(rel_vel_diff))
-
-            enemy_obs[:n_take, 0] = sel_rel[:, 0] / perception_radius
-            enemy_obs[:n_take, 1] = sel_rel[:, 1] / perception_radius
-            enemy_obs[:n_take, 2] = sel_is_head.astype(np.float32)
-            enemy_obs[:n_take, 3] = np.log(np.maximum(sel_mass, 1.0) / initial_mass)
-            enemy_obs[:n_take, 4] = sel_speed
-            enemy_obs[:n_take, 5] = rel_vel_angle
-            enemy_obs[:n_take, 6] = sel_radius
-
-    # 4. Minimap
+    # 7. Minimap
     minimap = compute_minimap(
         state.all_snake_positions,
         state.all_snake_masses,
@@ -112,6 +62,178 @@ def compute_observation(
     return {
         "self_state": self_state,
         "food": food_obs,
+        "prey": prey_obs,
         "enemies": enemy_obs,
+        "danger_segments": danger_obs,
+        "own_body": own_body_obs,
         "minimap": minimap,
     }
+
+
+def _compute_food(
+    state: RawGameState,
+    k: int,
+    perception_radius: float,
+    corpse: bool,
+) -> NDArray[np.float32]:
+    obs = np.zeros((k, 3), dtype=np.float32)
+    if len(state.food_positions) == 0:
+        return obs
+
+    mask = state.food_is_corpse if corpse else ~state.food_is_corpse
+    if not np.any(mask):
+        return obs
+
+    positions = state.food_positions[mask]
+    values = state.food_values[mask]
+    rel = positions - np.array([state.self_x, state.self_y], dtype=np.float32)
+    dists = np.sqrt(np.sum(rel * rel, axis=1))
+
+    within = dists < perception_radius
+    if not np.any(within):
+        return obs
+
+    rel_in = rel[within]
+    dists_in = dists[within]
+    vals_in = values[within]
+
+    order = np.argsort(dists_in)
+    n_take = min(len(order), k)
+    order = order[:n_take]
+
+    obs[:n_take, 0] = rel_in[order, 0] / perception_radius
+    obs[:n_take, 1] = rel_in[order, 1] / perception_radius
+    obs[:n_take, 2] = vals_in[order]
+    return obs
+
+
+def _compute_enemies(
+    state: RawGameState,
+    obs_config: ObsConfig,
+    perception_radius: float,
+    initial_mass: float,
+    snake_slot_mapping: dict[int, int] | None,
+) -> NDArray[np.float32]:
+    k_enemies = obs_config.k_enemies
+    k_body = obs_config.k_enemy_body_samples
+    enemy_obs = np.zeros((k_enemies, obs_config.enemy_features), dtype=np.float32)
+
+    if not state.enemy_snakes:
+        return enemy_obs
+
+    # Build mapping if not provided (naive distance-sorted for bots/deployment)
+    if snake_slot_mapping is None:
+        sorted_snakes = sorted(
+            state.enemy_snakes,
+            key=lambda s: math.hypot(s.head_x - state.self_x, s.head_y - state.self_y),
+        )
+        snake_slot_mapping = {}
+        for i, s in enumerate(sorted_snakes[:k_enemies]):
+            snake_slot_mapping[s.snake_id] = i
+
+    for info in state.enemy_snakes:
+        slot = snake_slot_mapping.get(info.snake_id)
+        if slot is None or slot >= k_enemies:
+            continue
+
+        row = enemy_obs[slot]
+
+        # [0-1] head position relative to self
+        row[0] = (info.head_x - state.self_x) / perception_radius
+        row[1] = (info.head_y - state.self_y) / perception_radius
+
+        # [2-25] 12 body samples x (dx, dy)
+        segs = info.segments
+        n_segs = len(segs)
+        if n_segs > 0:
+            if n_segs <= k_body:
+                sampled = segs
+                n_sampled = n_segs
+            else:
+                indices = np.linspace(0, n_segs - 1, k_body).astype(np.intp)
+                sampled = segs[indices]
+                n_sampled = k_body
+
+            rel = sampled - np.array([state.self_x, state.self_y], dtype=np.float32)
+            for j in range(n_sampled):
+                row[2 + j * 2] = rel[j, 0] / perception_radius
+                row[2 + j * 2 + 1] = rel[j, 1] / perception_radius
+
+        # [26] log(mass / 10)
+        row[26] = math.log(max(info.mass, 1.0) / initial_mass)
+        # [27] speed
+        row[27] = info.speed
+        # [28-29] heading direction
+        row[28] = math.cos(info.angle)
+        row[29] = math.sin(info.angle)
+        # [30] boosting
+        row[30] = 1.0 if info.boosting else 0.0
+        # [31] is_active
+        row[31] = 1.0
+
+    return enemy_obs
+
+
+def _compute_danger_segments(
+    state: RawGameState,
+    obs_config: ObsConfig,
+    perception_radius: float,
+) -> NDArray[np.float32]:
+    k = obs_config.k_danger_segments
+    danger_obs = np.zeros((k, obs_config.danger_features), dtype=np.float32)
+
+    if len(state.enemy_segments) == 0:
+        return danger_obs
+
+    rel = state.enemy_segments - np.array([state.self_x, state.self_y], dtype=np.float32)
+    dists = np.sqrt(np.sum(rel * rel, axis=1))
+
+    within = dists < perception_radius
+    if not np.any(within):
+        return danger_obs
+
+    rel_in = rel[within]
+    dists_in = dists[within]
+    radius_in = state.enemy_segment_radius[within]
+
+    order = np.argsort(dists_in)
+    n_take = min(len(order), k)
+    order = order[:n_take]
+
+    danger_obs[:n_take, 0] = rel_in[order, 0] / perception_radius
+    danger_obs[:n_take, 1] = rel_in[order, 1] / perception_radius
+    danger_obs[:n_take, 2] = radius_in[order] / 20.0
+
+    return danger_obs
+
+
+def _compute_own_body(
+    state: RawGameState,
+    obs_config: ObsConfig,
+    perception_radius: float,
+) -> NDArray[np.float32]:
+    k = obs_config.k_own_body
+    own_body_obs = np.zeros((k, obs_config.own_body_features), dtype=np.float32)
+
+    if len(state.own_segments) <= 1:
+        return own_body_obs
+
+    # Skip head (index 0) — agent knows head position from self_state
+    body_segs = state.own_segments[1:]
+    n_segs = len(body_segs)
+    if n_segs == 0:
+        return own_body_obs
+
+    if n_segs <= k:
+        sampled = body_segs
+        n_take = n_segs
+    else:
+        indices = np.linspace(0, n_segs - 1, k, dtype=np.int32)
+        sampled = body_segs[indices]
+        n_take = k
+
+    rel = sampled - np.array([state.self_x, state.self_y], dtype=np.float32)
+    own_body_obs[:n_take, 0] = rel[:n_take, 0] / perception_radius
+    own_body_obs[:n_take, 1] = rel[:n_take, 1] / perception_radius
+
+    return own_body_obs
