@@ -14,12 +14,17 @@ class BotPolicy:
     Stateless — computes action from observation alone.
     """
 
-    def __init__(self, config: WorldConfig, rng: np.random.Generator) -> None:
+    def __init__(self, config: WorldConfig, rng: np.random.Generator, hunter_prob: float = 0.3) -> None:
         self._config = config
         self._rng = rng
         # Reduced from 0.2: bots were fleeing at such long range they never
         # got killed, making it impossible for the agent to learn kill mechanics.
         self._danger_distance = 0.08
+        # Some bots are "hunters" — chase the nearest enemy headlong with boost
+        # instead of fleeing. They die a lot, but they're the population that
+        # actually crashes into the RL agent's body, generating kill experience.
+        self._hunter_prob = hunter_prob
+        self._is_hunter = float(self._rng.random()) < hunter_prob
 
     def act(self, obs: dict[str, NDArray[np.float32]], **kwargs: Any) -> NDArray[np.float32]:
         self_state = obs["self_state"]
@@ -31,27 +36,38 @@ class BotPolicy:
 
         dir_cos = current_cos
         dir_sin = current_sin
+        boost = 0.0
 
-        found_danger = False
-        closest_head_dist = float("inf")
-        closest_head_x = 0.0
-        closest_head_y = 0.0
-
-        # enemies is (16, 32): index 31 = is_active, 0-1 = head_dx/dy
+        # Find the nearest active enemy (used by both flee and hunt logic)
+        nearest_dist = float("inf")
+        nearest_x = 0.0
+        nearest_y = 0.0
         for i in range(enemies.shape[0]):
             if enemies[i, 31] > 0.5:  # is_active
                 ex = float(enemies[i, 0])
                 ey = float(enemies[i, 1])
                 dist = math.sqrt(ex * ex + ey * ey)
-                if dist < self._danger_distance and dist < closest_head_dist:
-                    closest_head_dist = dist
-                    closest_head_x = ex
-                    closest_head_y = ey
-                    found_danger = True
+                if dist < nearest_dist:
+                    nearest_dist = dist
+                    nearest_x = ex
+                    nearest_y = ey
+
+        if self._is_hunter and nearest_dist < 0.5:
+            # Hunter mode: charge directly at nearest enemy head. Boost when close.
+            mag = math.sqrt(nearest_x * nearest_x + nearest_y * nearest_y)
+            if mag > 0:
+                dir_cos = nearest_x / mag
+                dir_sin = nearest_y / mag
+                if nearest_dist < 0.15:
+                    boost = 1.0
+            return _normalize_action(dir_cos, dir_sin, boost, self._rng)
+
+        # Avoidant fallback (the original logic)
+        found_danger = nearest_dist < self._danger_distance
 
         if found_danger:
-            flee_x = -closest_head_x
-            flee_y = -closest_head_y
+            flee_x = -nearest_x
+            flee_y = -nearest_y
             mag = math.sqrt(flee_x * flee_x + flee_y * flee_y)
             if mag > 0:
                 dir_cos = flee_x / mag
@@ -76,12 +92,14 @@ class BotPolicy:
                 dir_cos = math.cos(angle)
                 dir_sin = math.sin(angle)
 
-        dir_cos += float(self._rng.normal(0, 0.1))
-        dir_sin += float(self._rng.normal(0, 0.1))
+        return _normalize_action(dir_cos, dir_sin, boost, self._rng)
 
-        mag = math.sqrt(dir_cos * dir_cos + dir_sin * dir_sin)
-        if mag > 0:
-            dir_cos /= mag
-            dir_sin /= mag
 
-        return np.array([dir_cos, dir_sin, 0.0], dtype=np.float32)
+def _normalize_action(dir_cos: float, dir_sin: float, boost: float, rng: np.random.Generator) -> NDArray[np.float32]:
+    dir_cos += float(rng.normal(0, 0.1))
+    dir_sin += float(rng.normal(0, 0.1))
+    mag = math.sqrt(dir_cos * dir_cos + dir_sin * dir_sin)
+    if mag > 0:
+        dir_cos /= mag
+        dir_sin /= mag
+    return np.array([dir_cos, dir_sin, boost], dtype=np.float32)
