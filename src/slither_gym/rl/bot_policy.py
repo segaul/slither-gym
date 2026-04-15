@@ -17,7 +17,9 @@ class BotPolicy:
     def __init__(self, config: WorldConfig, rng: np.random.Generator) -> None:
         self._config = config
         self._rng = rng
-        self._danger_distance = 0.2
+        # Reduced from 0.2: bots were fleeing at such long range they never
+        # got killed, making it impossible for the agent to learn kill mechanics.
+        self._danger_distance = 0.08
 
     def act(self, obs: dict[str, NDArray[np.float32]], **kwargs: Any) -> NDArray[np.float32]:
         self_state = obs["self_state"]
