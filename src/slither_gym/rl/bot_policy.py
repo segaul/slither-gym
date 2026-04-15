@@ -14,7 +14,7 @@ class BotPolicy:
     Stateless — computes action from observation alone.
     """
 
-    def __init__(self, config: WorldConfig, rng: np.random.Generator, hunter_prob: float = 0.3) -> None:
+    def __init__(self, config: WorldConfig, rng: np.random.Generator, hunter_prob: float = 0.5) -> None:
         self._config = config
         self._rng = rng
         # Reduced from 0.2: bots were fleeing at such long range they never
