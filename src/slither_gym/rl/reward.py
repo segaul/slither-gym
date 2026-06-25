@@ -14,7 +14,7 @@ def compute_reward(
     reward += result.mass_delta * 1.0
     reward += result.remains_eaten * 1.0
     reward += result.kill_count * 5.0
-    reward += 0.01
+    reward += config.survival_bonus
 
     if not result.alive:
         reward -= 10.0

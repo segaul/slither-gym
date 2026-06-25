@@ -169,6 +169,12 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         # Expose StepResult and WorldConfig for external reward computation
         if last_step_result is not None:
             info["step_result"] = last_step_result
+            if terminated:
+                # Death cause from killed_by: None = ran out of bounds (wall); otherwise
+                # = ran into snake <id>'s body. Self-collision is impossible (the collision
+                # query excludes own segments), so those are the only two causes.
+                kb = last_step_result.killed_by
+                info["death_cause"] = "wall" if kb is None else f"enemy:{kb}"
         info["world_config"] = self._world_config
 
         return rl_obs, total_reward, terminated, truncated, info

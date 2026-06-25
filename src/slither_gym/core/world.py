@@ -154,7 +154,10 @@ class World:
         remains_eaten: dict[int, float] = {sid: 0.0 for sid in alive_ids}
         for sid in self._snakes.alive_ids():
             state = self._snakes.get_state(sid)
-            collect_radius = state.segment_radius * 3 + 10.0
+            collect_radius = (
+                state.segment_radius * config.collect_radius_mass_mult
+                + config.collect_radius_base
+            )
             collected = self._food.collect_near(state.head_x, state.head_y, collect_radius)
             if collected > 0:
                 self._snakes.grow(sid, collected, self._segments)
@@ -200,6 +203,9 @@ class World:
 
     def get_food_values(self) -> NDArray[np.float32]:
         return self._food.get_alive_values()
+
+    def get_food_is_corpse(self) -> NDArray[np.bool_]:
+        return self._food.get_alive_is_corpse()
 
     def get_tick(self) -> int:
         return self._tick

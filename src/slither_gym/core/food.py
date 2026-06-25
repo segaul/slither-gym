@@ -17,6 +17,7 @@ class FoodManager:
         self._positions = np.zeros((config.max_food, 2), dtype=np.float32)
         self._values = np.zeros(config.max_food, dtype=np.float32)
         self._alive = np.zeros(config.max_food, dtype=np.bool_)
+        self._is_corpse = np.zeros(config.max_food, dtype=np.bool_)
         self._count: int = 0
         self._free: list[int] = list(range(config.max_food))
 
@@ -34,10 +35,11 @@ class FoodManager:
             y = float(dist * np.sin(angle))
             # Most food is small, occasionally larger
             value = float(self._rng.uniform(self._config.food_value_min, self._config.food_value_max))
-            self.spawn_at(x, y, value)
+            self.spawn_at(x, y, value, corpse=False)
 
-    def spawn_at(self, x: float, y: float, value: float) -> None:
-        """Spawn a single pellet at a specific position (for corpse drops).
+    def spawn_at(self, x: float, y: float, value: float, corpse: bool = True) -> None:
+        """Spawn a single pellet at a specific position.
+        corpse=True for corpse drops (default), False for regular food.
         If pool is full, evicts the lowest-value alive food to make room."""
         if not self._free:
             # Evict: find the lowest-value alive food and remove it
@@ -53,6 +55,7 @@ class FoodManager:
         self._positions[idx, 1] = y
         self._values[idx] = value
         self._alive[idx] = True
+        self._is_corpse[idx] = corpse
         self._count += 1
 
     def collect_near(self, x: float, y: float, radius: float) -> float:
@@ -82,4 +85,8 @@ class FoodManager:
 
     def get_alive_values(self) -> NDArray[np.float32]:
         result: NDArray[np.float32] = self._values[self._alive]
+        return result
+
+    def get_alive_is_corpse(self) -> NDArray[np.bool_]:
+        result: NDArray[np.bool_] = self._is_corpse[self._alive]
         return result

@@ -11,7 +11,7 @@ SegmentArray = NDArray[np.float32]  # shape (N, 2)
 @dataclass(frozen=True)
 class WorldConfig:
     map_radius: float = 3000.0
-    max_snakes: int = 32
+    max_snakes: int = 48
     max_segments_per_snake: int = 256
     max_food: int = 16384
     base_speed: float = 3.0
@@ -33,6 +33,10 @@ class WorldConfig:
     corpse_food_base: float = 2.0  # min corpse pellet value
     corpse_food_scale: float = 8.0  # max corpse pellet value (for huge snakes)
     perception_radius: float = 500.0
+    # --- E8 tunables (defaults = pre-E8 v1 behavior, byte-identical) ---
+    collect_radius_base: float = 10.0  # additive collect radius
+    collect_radius_mass_mult: float = 3.0  # collect radius per unit segment_radius
+    survival_bonus: float = 0.01  # per-tick survival reward
 
 
 @dataclass

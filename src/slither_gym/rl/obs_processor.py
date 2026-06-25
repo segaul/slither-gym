@@ -14,7 +14,7 @@ def compute_observation(
 ) -> dict[str, NDArray[np.float32]]:
     """
     Pure function. Same input always produces same output.
-    Returns {"self_state": (8,), "food": (K_f, 3), "prey": (K_p, 3),
+    Returns {"self_state": (12,), "food": (K_f, 3), "prey": (K_p, 3),
              "enemies": (K_e, 32), "danger_segments": (K_d, 3),
              "own_body": (K_b, 2), "minimap": (N, N)}.
     """
@@ -22,7 +22,36 @@ def compute_observation(
     max_segments = 256  # WorldConfig default
     perception_radius = 500.0
 
-    # 1. Self state (8)
+    # 1. Self state (12) — 8 original + 4 navigation compass
+    # Nearest food/prey direction as explicit scalars so the network
+    # can trivially learn "go toward food" without parsing 64 items.
+    nearest_food_dx, nearest_food_dy = 0.0, 0.0
+    nearest_prey_dx, nearest_prey_dy = 0.0, 0.0
+
+    # Compute nearest food direction
+    if len(state.food_positions) > 0:
+        food_mask = ~state.food_is_corpse
+        if np.any(food_mask):
+            food_rel = state.food_positions[food_mask] - np.array([state.self_x, state.self_y])
+            food_dists = np.sqrt(np.sum(food_rel * food_rel, axis=1))
+            within = food_dists < perception_radius
+            if np.any(within):
+                nearest_idx = food_dists[within].argmin()
+                nearest_food_dx = food_rel[within][nearest_idx, 0] / perception_radius
+                nearest_food_dy = food_rel[within][nearest_idx, 1] / perception_radius
+
+    # Compute nearest prey direction
+    if len(state.food_positions) > 0:
+        prey_mask = state.food_is_corpse
+        if np.any(prey_mask):
+            prey_rel = state.food_positions[prey_mask] - np.array([state.self_x, state.self_y])
+            prey_dists = np.sqrt(np.sum(prey_rel * prey_rel, axis=1))
+            within = prey_dists < perception_radius
+            if np.any(within):
+                nearest_idx = prey_dists[within].argmin()
+                nearest_prey_dx = prey_rel[within][nearest_idx, 0] / perception_radius
+                nearest_prey_dy = prey_rel[within][nearest_idx, 1] / perception_radius
+
     self_state = np.array([
         state.self_x / state.map_radius,
         state.self_y / state.map_radius,
@@ -32,6 +61,10 @@ def compute_observation(
         state.self_speed,
         state.self_segment_count / max_segments,
         1.0 if state.self_boosting else 0.0,
+        nearest_food_dx,
+        nearest_food_dy,
+        nearest_prey_dx,
+        nearest_prey_dy,
     ], dtype=np.float32)
 
     # 2. Food observation (floor food only — corpse food goes to prey)
