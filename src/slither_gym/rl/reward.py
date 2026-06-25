@@ -17,7 +17,7 @@ def compute_reward(
     reward += config.survival_bonus
 
     if not result.alive:
-        reward -= 10.0
+        reward += config.death_penalty
 
     dist_from_center = math.sqrt(snake_state.head_x ** 2 + snake_state.head_y ** 2)
     edge_ratio = dist_from_center / config.map_radius
