@@ -38,6 +38,10 @@ class WorldConfig:
     collect_radius_mass_mult: float = 3.0  # collect radius per unit segment_radius
     survival_bonus: float = 0.01  # per-tick survival reward
     death_penalty: float = -10.0  # terminal reward on death (E9: rescale for scarce-food regime)
+    # E11: bot-difficulty curriculum for kill-discoverability. 1.0 = full realistic mix
+    # (byte-identical to pre-E11); lower values inject "careless" bots that don't flee danger
+    # and run into the agent's body (exploitable → the agent samples the +5 kill reward).
+    bot_difficulty: float = 1.0
 
 
 @dataclass

@@ -30,7 +30,15 @@ class BotPolicy:
     def __init__(self, config: WorldConfig, rng: np.random.Generator, **kwargs: Any) -> None:
         self._config = config
         self._rng = rng
-        self._personality: str = rng.choice(self.PERSONALITIES, p=self.WEIGHTS)
+        # E11 kill-discoverability curriculum: with prob (1 - bot_difficulty) this bot is
+        # "careless" — it seeks food but NEVER flees, so it crashes into the agent's body and
+        # is easy to kill. The remaining `bot_difficulty` mass keeps the realistic mix. At
+        # bot_difficulty=1.0 (default) P(careless)=0 → byte-identical to the pre-E11 population.
+        difficulty = float(getattr(config, "bot_difficulty", 1.0))
+        if difficulty < 1.0 and float(rng.random()) >= difficulty:
+            self._personality: str = "careless"
+        else:
+            self._personality = str(rng.choice(self.PERSONALITIES, p=self.WEIGHTS))
         self._wander_angle: float = float(rng.uniform(0, 2 * math.pi))
 
     def act(self, obs: dict[str, NDArray[np.float32]], **kwargs: Any) -> NDArray[np.float32]:
@@ -53,8 +61,20 @@ class BotPolicy:
             return self._act_circler(my_cos, my_sin, my_log_mass, nearest, food)
         elif self._personality == "escaper":
             return self._act_escaper(my_cos, my_sin, nearest, food)
+        elif self._personality == "careless":
+            return self._act_careless(my_cos, my_sin, food)
         else:
             return self._act_food_seeker(my_cos, my_sin, nearest, food)
+
+    def _act_careless(
+        self, my_cos: float, my_sin: float, food: NDArray[np.float32],
+    ) -> NDArray[np.float32]:
+        """E11 curriculum prey: seek food but NEVER flee danger — crashes into bodies,
+        so the RL agent can discover/sample kills. No danger check at all."""
+        direction = self._seek_food(my_cos, my_sin, food)
+        if direction is not None:
+            return _make_action(*direction, 0.0, self._rng)
+        return self._wander(my_cos, my_sin)
 
     def _act_food_seeker(
         self, my_cos: float, my_sin: float,
