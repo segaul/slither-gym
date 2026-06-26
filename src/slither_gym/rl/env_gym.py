@@ -47,7 +47,12 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
 
         self._world: World | None = None
         self._rng = np.random.default_rng(seed)
-        self._bot_policy = BotPolicy(world_config, self._rng)
+        # E11 curriculum: optional runtime bot-difficulty override (None → use world_config).
+        # The trainer anneals this via set_bot_difficulty(); eval/static envs leave it None.
+        self._bot_difficulty_override: float | None = None
+        self._bot_policy = BotPolicy(
+            world_config, self._rng, bot_difficulty=self._bot_difficulty_override
+        )
         self._bot_policies: dict[int, Any] = bot_policies or {}
         self._rl_agent_id: AgentId = "snake_0"
         self._tick_count: int = 0
@@ -67,6 +72,16 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         self._snake_cache = SnakeCache(max_slots=obs_config.k_enemies)
         self._bot_obs_cache: dict[int, dict[str, NDArray[np.float32]]] = {}
 
+    def set_bot_difficulty(self, difficulty: float | None) -> None:
+        """E11 curriculum hook: override bot difficulty for subsequent episodes.
+
+        Takes effect on the next reset (when the shared BotPolicy is re-rolled). 1.0 =
+        full realistic mix; lower = more "careless" (non-fleeing, killable) prey so the
+        agent samples kills. None restores the WorldConfig value. The eval never calls
+        this, so eval bots stay frozen at the config default.
+        """
+        self._bot_difficulty_override = None if difficulty is None else float(difficulty)
+
     def reset(
         self,
         seed: int | None = None,
@@ -76,7 +91,9 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         if seed is not None:
             self._seed = seed
             self._rng = np.random.default_rng(seed)
-            self._bot_policy = BotPolicy(self._world_config, self._rng)
+            self._bot_policy = BotPolicy(
+                self._world_config, self._rng, bot_difficulty=self._bot_difficulty_override
+            )
 
         self._world = World(self._world_config, seed=self._seed)
         self._tick_count = 0

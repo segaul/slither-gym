@@ -34,7 +34,10 @@ class BotPolicy:
         # "careless" — it seeks food but NEVER flees, so it crashes into the agent's body and
         # is easy to kill. The remaining `bot_difficulty` mass keeps the realistic mix. At
         # bot_difficulty=1.0 (default) P(careless)=0 → byte-identical to the pre-E11 population.
-        difficulty = float(getattr(config, "bot_difficulty", 1.0))
+        # Runtime override (E11 curriculum anneal) takes precedence over the frozen
+        # WorldConfig value; None → fall back to config (keeps eval/static envs exact).
+        override = kwargs.get("bot_difficulty", None)
+        difficulty = float(override) if override is not None else float(getattr(config, "bot_difficulty", 1.0))
         if difficulty < 1.0 and float(rng.random()) >= difficulty:
             self._personality: str = "careless"
         else:
