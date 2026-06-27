@@ -39,7 +39,8 @@ class BotPolicy:
         override = kwargs.get("bot_difficulty", None)
         difficulty = float(override) if override is not None else float(getattr(config, "bot_difficulty", 1.0))
         if difficulty < 1.0 and float(rng.random()) >= difficulty:
-            self._personality: str = "careless"
+            # Curriculum prey personality (E12 default "kamikaze"; E11 used "careless").
+            self._personality: str = str(getattr(config, "curriculum_prey", "kamikaze"))
         else:
             self._personality = str(rng.choice(self.PERSONALITIES, p=self.WEIGHTS))
         self._wander_angle: float = float(rng.uniform(0, 2 * math.pi))
@@ -66,14 +67,33 @@ class BotPolicy:
             return self._act_escaper(my_cos, my_sin, nearest, food)
         elif self._personality == "careless":
             return self._act_careless(my_cos, my_sin, food)
+        elif self._personality == "kamikaze":
+            return self._act_kamikaze(my_cos, my_sin, nearest, food)
         else:
             return self._act_food_seeker(my_cos, my_sin, nearest, food)
 
     def _act_careless(
         self, my_cos: float, my_sin: float, food: NDArray[np.float32],
     ) -> NDArray[np.float32]:
-        """E11 curriculum prey: seek food but NEVER flee danger — crashes into bodies,
-        so the RL agent can discover/sample kills. No danger check at all."""
+        """E11 curriculum prey (REFUTED): seek food but NEVER flee. Passive — rarely collides,
+        so the agent never sampled kills. Kept for E11 reproducibility; superseded by kamikaze."""
+        direction = self._seek_food(my_cos, my_sin, food)
+        if direction is not None:
+            return _make_action(*direction, 0.0, self._rng)
+        return self._wander(my_cos, my_sin)
+
+    def _act_kamikaze(
+        self, my_cos: float, my_sin: float,
+        nearest: dict, food: NDArray[np.float32],
+    ) -> NDArray[np.float32]:
+        """E12 curriculum prey: CHARGE the nearest snake's body (boost, never flee) so head-on
+        collisions actually happen and the RL agent samples the +5 kill. Falls back to seeking
+        food / wandering when no enemy is in view (keeps moving)."""
+        if nearest["active"]:
+            tx, ty = nearest["x"], nearest["y"]
+            mag = math.sqrt(tx * tx + ty * ty)
+            if mag > 0:
+                return _make_action(tx / mag, ty / mag, 1.0, self._rng)  # boost straight at it
         direction = self._seek_food(my_cos, my_sin, food)
         if direction is not None:
             return _make_action(*direction, 0.0, self._rng)

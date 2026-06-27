@@ -38,10 +38,14 @@ class WorldConfig:
     collect_radius_mass_mult: float = 3.0  # collect radius per unit segment_radius
     survival_bonus: float = 0.01  # per-tick survival reward
     death_penalty: float = -10.0  # terminal reward on death (E9: rescale for scarce-food regime)
-    # E11: bot-difficulty curriculum for kill-discoverability. 1.0 = full realistic mix
-    # (byte-identical to pre-E11); lower values inject "careless" bots that don't flee danger
-    # and run into the agent's body (exploitable → the agent samples the +5 kill reward).
+    # E11/E12: bot-difficulty curriculum for kill-discoverability. 1.0 = full realistic mix
+    # (byte-identical to pre-E11, and what the eval always uses). Below 1.0, prob (1-difficulty)
+    # of each bot being the `curriculum_prey` personality. Only matters when difficulty < 1.0.
     bot_difficulty: float = 1.0
+    # Which exploitable personality the curriculum injects. E11 used "careless" (passive, REFUTED —
+    # never collided). E12 default "kamikaze" (charges the nearest snake's body → forces the
+    # collisions/kills the agent must sample). "careless" preserved for E11 reproducibility.
+    curriculum_prey: str = "kamikaze"
 
 
 @dataclass
