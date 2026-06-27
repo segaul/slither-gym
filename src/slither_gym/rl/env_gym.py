@@ -71,6 +71,7 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
 
         self._snake_cache = SnakeCache(max_slots=obs_config.k_enemies)
         self._bot_obs_cache: dict[int, dict[str, NDArray[np.float32]]] = {}
+        self._prev_phi: float = 0.0  # E13: cut-readiness potential Φ(s) from the previous RL step
 
     def set_bot_difficulty(self, difficulty: float | None) -> None:
         """E11 curriculum hook: override bot difficulty for subsequent episodes.
@@ -104,7 +105,61 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
 
         rl_obs = self._get_rl_observation()
         self._update_bot_obs_cache()
+        # E13: seed Φ(s_0) so the first step's shaping telescopes correctly.
+        self._prev_phi = (
+            self._compute_cut_potential() if self._world_config.kill_shaping_coef != 0.0 else 0.0
+        )
         return rl_obs, {}
+
+    def _compute_cut_potential(self) -> float:
+        """E13 cut-readiness potential Φ(s) ∈ [0, 1] — STATE-ONLY (no actions/time/history).
+
+        Φ = max over alive enemies of [proximity · alignment], where for an enemy head h with
+        unit heading ĥ and my nearest *body* segment b (segments behind my head):
+          proximity = max(0, 1 − |h−b| / R)              (1 when touching, 0 beyond R)
+          alignment = max(0, ĥ · unit(b − h))            (1 when charging straight at b, 0 if away)
+        High Φ ⇔ an enemy is about to drive its head into my body (= a kill credited to me). Φ→0
+        when no enemy is near/aligned. Kill geometry uses MY BODY, not my head (head-on = my death).
+        """
+        world = self._world
+        if world is None:
+            return 0.0
+        R = float(self._world_config.kill_shaping_radius)
+        # My alive body segments EXCLUDING the head region (a kill needs head→body, not head→head).
+        owner = world._seg_owner
+        alive = world._seg_alive
+        mine = (owner == 0) & alive
+        my_segs = world._segments[mine]
+        if my_segs.shape[0] <= 1:
+            return 0.0
+        states = world.get_snake_states()
+        me = states.get(0)
+        if me is None or not me.alive:
+            return 0.0
+        # Drop the segment nearest my head so "proximity to my own head" isn't counted as cut-ready.
+        head = np.array([me.head_x, me.head_y], dtype=np.float32)
+        d_head = np.sum((my_segs - head) ** 2, axis=1)
+        body = my_segs[d_head > (2.0 * self._world_config.segment_spacing) ** 2]
+        if body.shape[0] == 0:
+            return 0.0
+        best = 0.0
+        for sid, s in states.items():
+            if sid == 0 or not s.alive:
+                continue
+            h = np.array([s.head_x, s.head_y], dtype=np.float32)
+            rel = body - h                                   # vectors head→each of my segments
+            d2 = np.sum(rel * rel, axis=1)
+            j = int(np.argmin(d2))
+            dist = float(np.sqrt(d2[j]))
+            if dist >= R:
+                continue
+            proximity = 1.0 - dist / R
+            seg_dir = rel[j] / (dist + 1e-6)                 # unit head→nearest segment
+            align = math.cos(s.angle) * float(seg_dir[0]) + math.sin(s.angle) * float(seg_dir[1])
+            phi = proximity * max(0.0, align)
+            if phi > best:
+                best = phi
+        return best
 
     def step(
         self,
@@ -157,6 +212,16 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
                     break
 
         truncated = not terminated and self._tick_count >= self._max_ticks
+
+        # E13: potential-based kill-credit shaping, applied ONCE per RL step (here, the RL-step
+        # boundary), not per physics tick. r_shape = coef·(γ·Φ(s′) − Φ(s)). Terminal Φ(s′)=0.
+        # Computed before respawn so Φ reflects the state the agent actually acted into.
+        if config.kill_shaping_coef != 0.0:
+            phi_next = 0.0 if terminated else self._compute_cut_potential()
+            total_reward += config.kill_shaping_coef * (
+                config.kill_shaping_gamma * phi_next - self._prev_phi
+            )
+            self._prev_phi = phi_next
 
         if self._respawn_bots:
             for i in range(1, 1 + self._num_bots):

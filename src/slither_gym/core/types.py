@@ -46,6 +46,12 @@ class WorldConfig:
     # never collided). E12 default "kamikaze" (charges the nearest snake's body → forces the
     # collisions/kills the agent must sample). "careless" preserved for E11 reproducibility.
     curriculum_prey: str = "kamikaze"
+    # E13: potential-based kill-credit shaping. coef=0.0 → OFF (byte-identical; eval/E9–E12 unchanged).
+    # Adds r_shape = coef·(γ·Φ(s′) − Φ(s)) once per RL step, where Φ ∈ [0,1] = cut-readiness (an enemy
+    # head close to + heading into one of my body segments). γ MUST match the trainer's RL γ.
+    kill_shaping_coef: float = 0.0
+    kill_shaping_gamma: float = 0.997  # must equal V4Config.gamma
+    kill_shaping_radius: float = 120.0  # world-units: cut "proximity" scale (head-to-body distance)
 
 
 @dataclass
