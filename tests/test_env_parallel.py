@@ -19,7 +19,7 @@ def test_observation_shapes() -> None:
     obs, _ = env.reset()
 
     for agent_id, ob in obs.items():
-        assert ob["self_state"].shape == (8,)
+        assert ob["self_state"].shape == (12,)
         assert ob["food"].shape == (obs_config.k_food, obs_config.food_features)
         assert ob["prey"].shape == (obs_config.k_prey, obs_config.prey_features)
         assert ob["enemies"].shape == (obs_config.k_enemies, obs_config.enemy_features)

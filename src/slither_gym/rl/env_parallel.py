@@ -143,7 +143,7 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
         obs_config = self._obs_config
         return gymnasium.spaces.Dict({
             "self_state": gymnasium.spaces.Box(
-                low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32,
+                low=-np.inf, high=np.inf, shape=(12,), dtype=np.float32,
             ),
             "food": gymnasium.spaces.Box(
                 low=-np.inf, high=np.inf,
@@ -274,7 +274,7 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
     def _empty_obs(self) -> dict[str, NDArray[np.float32]]:
         obs_config = self._obs_config
         return {
-            "self_state": np.zeros(8, dtype=np.float32),
+            "self_state": np.zeros(12, dtype=np.float32),
             "food": np.zeros((obs_config.k_food, obs_config.food_features), dtype=np.float32),
             "prey": np.zeros((obs_config.k_prey, obs_config.prey_features), dtype=np.float32),
             "enemies": np.zeros((obs_config.k_enemies, obs_config.enemy_features), dtype=np.float32),

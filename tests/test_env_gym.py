@@ -10,7 +10,7 @@ from slither_gym.core.types import WorldConfig
 def test_reset_observation_shape() -> None:
     env = SlitherGymEnv(seed=42)
     obs, info = env.reset()
-    assert obs["self_state"].shape == (8,)
+    assert obs["self_state"].shape == (12,)
     assert obs["food"].shape == (64, 3)
     assert obs["prey"].shape == (16, 3)
     assert obs["enemies"].shape == (16, 32)
