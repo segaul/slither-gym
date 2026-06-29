@@ -52,6 +52,12 @@ class WorldConfig:
     kill_shaping_coef: float = 0.0
     kill_shaping_gamma: float = 0.997  # must equal V4Config.gamma
     kill_shaping_radius: float = 120.0  # world-units: cut "proximity" scale (head-to-body distance)
+    # E15: "gorge" bonus — extra reward for eating a LOT of corpse mass AT ONCE (= eating prey/kills),
+    # not slow pellet foraging. Fires only when a single tick's corpse intake exceeds gorge_threshold.
+    # coef=0 → OFF (byte-identical). Pulls the agent toward where snakes die (combat), making peaceful
+    # foraging suboptimal — the E14 reform.
+    gorge_bonus_coef: float = 0.0
+    gorge_threshold: float = 5.0  # corpse-mass eaten in one tick that counts as a "big gulp" of prey
 
 
 @dataclass

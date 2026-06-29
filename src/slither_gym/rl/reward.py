@@ -16,6 +16,12 @@ def compute_reward(
     reward += result.kill_count * 5.0
     reward += config.survival_bonus
 
+    # E15: gorge bonus — eating a big chunk of corpse AT ONCE (= consuming prey/a kill) pays extra,
+    # on top of the linear remains reward. Only big single-tick gulps qualify; slow pellet foraging
+    # doesn't. Not farmable without a real corpse nearby (can't fabricate one except by killing).
+    if config.gorge_bonus_coef != 0.0 and result.remains_eaten >= config.gorge_threshold:
+        reward += config.gorge_bonus_coef * result.remains_eaten
+
     if not result.alive:
         reward += config.death_penalty
 
