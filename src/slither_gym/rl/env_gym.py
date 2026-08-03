@@ -71,6 +71,9 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
 
         self._snake_cache = SnakeCache(max_slots=obs_config.k_enemies)
         self._bot_obs_cache: dict[int, dict[str, NDArray[np.float32]]] = {}
+        # E29 per-snake obs: distinct-k_danger ObsConfigs for opponents trained at a different
+        # danger width than the agent (built lazily in _obs_config_for_bot).
+        self._per_kdanger_obs_config: dict[int, ObsConfig] = {}
         self._prev_phi: float = 0.0  # E13: cut-readiness potential Φ(s) from the previous RL step
 
     def set_bot_difficulty(self, difficulty: float | None) -> None:
@@ -179,15 +182,29 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         boost = bool(action[2] > 0.5)
 
         bot_actions: dict[int, tuple[float, float, bool]] = {}
+        # Group alive, obs-cached bots by their policy object so policies that support batched
+        # inference (self-play/league ActorCriticBotPolicy) run ONE forward for all their bots
+        # instead of one per bot (the ~3.5× self-play speedup). Bots grouped by identity, so a
+        # league with distinct opponent policies batches each policy's bots separately. Scripted
+        # BotPolicy (no act_batch) falls through to the per-bot path → byte-identical behavior.
+        policy_groups: dict[int, tuple[Any, list[int]]] = {}
         for i in range(1, 1 + self._num_bots):
             state = self._world.get_snake_states().get(i)
             if state is not None and state.alive:
                 if i in self._bot_obs_cache:
                     policy = self._bot_policies.get(i, self._bot_policy)
-                    bot_act = policy.act(self._bot_obs_cache[i], snake_id=i)
-                    bot_actions[i] = (float(bot_act[0]), float(bot_act[1]), bool(bot_act[2] > 0.5))
+                    policy_groups.setdefault(id(policy), (policy, []))[1].append(i)
                 else:
                     bot_actions[i] = (math.cos(state.angle), math.sin(state.angle), False)
+        for policy, ids in policy_groups.values():
+            if len(ids) > 1 and hasattr(policy, "act_batch"):
+                acts = policy.act_batch([self._bot_obs_cache[i] for i in ids])
+                for i, a in zip(ids, acts):
+                    bot_actions[i] = (float(a[0]), float(a[1]), bool(a[2] > 0.5))
+            else:
+                for i in ids:
+                    a = policy.act(self._bot_obs_cache[i], snake_id=i)
+                    bot_actions[i] = (float(a[0]), float(a[1]), bool(a[2] > 0.5))
 
         total_reward = 0.0
         terminated = False
@@ -293,7 +310,21 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             if bot_state is None or not bot_state.alive:
                 continue
             raw = self._build_raw_state(i, bot_state, states, food_pos, food_vals, food_corpse)
-            self._bot_obs_cache[i] = compute_observation(raw, self._obs_config)
+            self._bot_obs_cache[i] = compute_observation(raw, self._obs_config_for_bot(i))
+
+    def _obs_config_for_bot(self, i: int) -> ObsConfig:
+        """Per-snake obs (E29 refactor): a policy-opponent trained at a different danger width
+        must receive obs at ITS width, not the (possibly wider) agent's. Falls back to the global
+        config for scripted bots / same-width policies. Cached per distinct k_danger."""
+        policy = self._bot_policies.get(i, self._bot_policy)
+        k = int(getattr(policy, "k_danger_segments", self._obs_config.k_danger_segments))
+        if k == self._obs_config.k_danger_segments:
+            return self._obs_config
+        cache = self._per_kdanger_obs_config
+        if k not in cache:
+            import dataclasses
+            cache[k] = dataclasses.replace(self._obs_config, k_danger_segments=k)
+        return cache[k]
 
     def _build_raw_state(
         self,
