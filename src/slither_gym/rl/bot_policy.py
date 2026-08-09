@@ -69,6 +69,10 @@ class BotPolicy:
             return self._act_careless(my_cos, my_sin, food)
         elif self._personality == "kamikaze":
             return self._act_kamikaze(my_cos, my_sin, nearest, food)
+        elif self._personality == "wanderer":
+            return self._act_wanderer()
+        elif self._personality == "greedy":
+            return self._act_greedy(my_cos, my_sin, nearest, food)
         else:
             return self._act_food_seeker(my_cos, my_sin, nearest, food)
 
@@ -81,6 +85,35 @@ class BotPolicy:
         if direction is not None:
             return _make_action(*direction, 0.0, self._rng)
         return self._wander(my_cos, my_sin)
+
+    def _act_greedy(
+        self, my_cos: float, my_sin: float,
+        nearest: dict, food: NDArray[np.float32],
+    ) -> NDArray[np.float32]:
+        """E21 opponent-realism prey: a GREEDY over-extender — boost-chases the nearest food and
+        only flees at POINT-BLANK range (dist < 0.05), unlike food_seeker (flees at 0.12) and escaper
+        (flees at 0.25). Models a greedy human/bot that commits to food and doesn't carefully dodge,
+        so it runs into an interposed body (cuttable) instead of evading it. The hunter diagnostic
+        tests whether this makes the 'cut' possible where the evasive standard mix made it ~0."""
+        if nearest["dist"] < 0.05:            # only bail out of a truly imminent collision
+            return self._flee(nearest, boost=True)
+        direction = self._seek_food(my_cos, my_sin, food)
+        if direction is not None:
+            return _make_action(*direction, 1.0, self._rng)   # boost toward food (over-extend)
+        return self._wander(my_cos, my_sin)
+
+    def _act_wanderer(self) -> NDArray[np.float32]:
+        """E18 trap-curriculum prey: a SLOW, PREDICTABLE drifter — steady forward motion with very
+        low heading variance, no boost, no food-seeking, no evasion, no charging. Unlike careless
+        (E11, seeks food so it turns away → rarely collides) and kamikaze (E12, charges → mutual
+        head-on death, no agent credit), the wanderer holds a near-constant heading so the RL agent
+        can OUT-MANEUVER it: boost ahead, swing its body across the wanderer's path, and the wanderer
+        plows head-first into the agent's body → a SURVIVING cut that earns the existing +5. The point
+        is discoverability of that maneuver, not the prey doing the work."""
+        self._wander_angle += float(self._rng.normal(0, 0.03))  # low variance = predictable path
+        return _make_action(
+            math.cos(self._wander_angle), math.sin(self._wander_angle), 0.0, self._rng,
+        )
 
     def _act_kamikaze(
         self, my_cos: float, my_sin: float,

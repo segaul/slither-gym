@@ -13,7 +13,7 @@ def compute_reward(
 
     reward += result.mass_delta * 1.0
     reward += result.remains_eaten * 1.0
-    reward += result.kill_count * 5.0
+    reward += result.kill_count * config.kill_reward_coef
     reward += config.survival_bonus
 
     # E15: gorge bonus — eating a big chunk of corpse AT ONCE (= consuming prey/a kill) pays extra,

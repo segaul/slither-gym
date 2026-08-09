@@ -58,10 +58,17 @@ class FoodManager:
         self._is_corpse[idx] = corpse
         self._count += 1
 
-    def collect_near(self, x: float, y: float, radius: float) -> float:
-        """Remove all food within radius of (x, y). Returns total value collected."""
+    def collect_near(self, x: float, y: float, radius: float) -> tuple[float, float]:
+        """Remove all food within radius of (x, y).
+
+        Returns (total_value, corpse_value) — the second is the part that came from
+        corpse pellets. Splitting these is what makes "a kill is worth more than a
+        pellet" expressible at all: `_is_corpse` has been tracked since corpses were
+        added but was never read here, so `StepResult.remains_eaten` (documented as
+        "mass gained from corpse food specifically") in fact counted ALL food.
+        """
         if self._count == 0:
-            return 0.0
+            return 0.0, 0.0
 
         dx = self._positions[:, 0] - x
         dy = self._positions[:, 1] - y
@@ -69,15 +76,26 @@ class FoodManager:
         hit = self._alive & (dist_sq < radius * radius)
 
         if not np.any(hit):
-            return 0.0
+            return 0.0, 0.0
 
         total = float(np.sum(self._values[hit]))
+        corpse = float(np.sum(self._values[hit & self._is_corpse]))
         hit_indices = np.where(hit)[0]
         self._alive[hit_indices] = False
         self._count -= len(hit_indices)
         self._free.extend(hit_indices.tolist())
 
-        return total
+        return total, corpse
+
+    def alive_floor_count(self) -> int:
+        """Alive NON-corpse pellets.
+
+        R1: the density top-up used total `alive_count()`, which includes corpse
+        drops, so corpses suppressed floor-food spawning to zero (regular pellets
+        measured collapsing 1737 -> 4 over 20k ticks while corpse pellets filled
+        the pool). The floor population must be governed by floor pellets alone.
+        """
+        return int(np.count_nonzero(self._alive & ~self._is_corpse))
 
     def alive_count(self) -> int:
         """Number of pellets currently alive (floor food + corpse drops)."""

@@ -215,13 +215,21 @@ class World:
                 state.segment_radius * config.collect_radius_mass_mult
                 + config.collect_radius_base
             )
-            collected = self._food.collect_near(state.head_x, state.head_y, collect_radius)
+            collected, corpse_collected = self._food.collect_near(
+                state.head_x, state.head_y, collect_radius
+            )
             if collected > 0:
                 self._snakes.grow(sid, collected, self._segments)
                 start, end_new = self._snakes.get_segment_slice(sid)
                 self._seg_alive[start:end_new] = True
                 self._seg_owner[start:end_new] = sid
-                remains_eaten[sid] = collected
+                # Legacy default reports ALL collected food here (what E9-E30 trained
+                # against, and what every reward term calibrated to). Corpse-only is
+                # what the field's own docstring always claimed, and is required for
+                # D1 ("a kill is worth ~400 pellets") to be expressible at all.
+                remains_eaten[sid] = (
+                    corpse_collected if config.remains_counts_corpse_only else collected
+                )
 
         # 6. Batch-spawn food
         self._tick += 1
@@ -233,7 +241,15 @@ class World:
                 # Top back up to the density target instead of adding a fixed
                 # count, so the steady-state pellet population is the measured
                 # density rather than an emergent spawn/eat equilibrium.
-                self._food.spawn_batch(max(0, target - self._food.alive_count()))
+                # R1: count FLOOR pellets only. Using the total (which includes corpse
+                # drops) let a few corpses push alive_count past the target and shut
+                # floor spawning off entirely for the rest of the episode.
+                have = (
+                    self._food.alive_floor_count()
+                    if config.density_counts_floor_only
+                    else self._food.alive_count()
+                )
+                self._food.spawn_batch(max(0, target - have))
 
         # 7. Build results
         results: dict[int, StepResult] = {}

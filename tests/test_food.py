@@ -24,9 +24,11 @@ def test_spawn_at_and_collect() -> None:
     rng = np.random.default_rng(42)
     fm = FoodManager(config, rng)
 
+    # spawn_at defaults to corpse=True, so both halves of the split should see it.
     fm.spawn_at(50.0, 50.0, 2.0)
-    collected = fm.collect_near(50.0, 50.0, 10.0)
+    collected, corpse = fm.collect_near(50.0, 50.0, 10.0)
     assert collected == 2.0
+    assert corpse == 2.0
 
     # Food should be removed
     assert len(fm.get_alive_positions()) == 0
@@ -38,8 +40,9 @@ def test_collect_empty_area() -> None:
     fm = FoodManager(config, rng)
 
     fm.spawn_at(1000.0, 1000.0, 1.0)
-    collected = fm.collect_near(0.0, 0.0, 10.0)
+    collected, corpse = fm.collect_near(0.0, 0.0, 10.0)
     assert collected == 0.0
+    assert corpse == 0.0
 
 
 def test_spawn_at_capacity() -> None:
@@ -77,3 +80,32 @@ def test_collect_near_benchmark() -> None:
     elapsed = (time.perf_counter() - start) / n * 1000
 
     assert elapsed < 0.02, f"collect_near too slow: {elapsed:.4f}ms (need <0.02ms)"
+
+
+def test_collect_near_splits_corpse_from_floor() -> None:
+    """collect_near must report floor and corpse intake separately.
+
+    The `_is_corpse` flag was tracked but never read, so `remains_eaten` — documented
+    as "mass gained from corpse food specifically" — actually counted every pellet.
+    That double-paid floor food and made the corpse premium (D1) inexpressible.
+    """
+    config = WorldConfig()
+    fm = FoodManager(config, np.random.default_rng(0))
+
+    fm.spawn_at(0.0, 0.0, 3.0, corpse=False)
+    fm.spawn_at(1.0, 1.0, 5.0, corpse=True)
+    total, corpse = fm.collect_near(0.0, 0.0, 10.0)
+    assert total == 8.0
+    assert corpse == 5.0
+
+
+def test_alive_floor_count_excludes_corpse() -> None:
+    """R1: the density top-up must not let corpse drops starve floor spawning."""
+    config = WorldConfig()
+    fm = FoodManager(config, np.random.default_rng(0))
+
+    fm.spawn_at(0.0, 0.0, 1.0, corpse=False)
+    for i in range(5):
+        fm.spawn_at(float(i), 0.0, 2.0, corpse=True)
+    assert fm.alive_count() == 6
+    assert fm.alive_floor_count() == 1

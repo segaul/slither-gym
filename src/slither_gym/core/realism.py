@@ -197,6 +197,13 @@ def realistic_world_config(
         body_radius_sct_divisor=REAL_SC_DIVISOR,
         # --- C4: ~62 pellets per 1e6 u^2 measured ---
         food_density_per_1e6=REAL_FOOD_DENSITY_PER_1E6,
+        # R1: hold the FLOOR population at that density. Counting corpse pellets
+        # toward it let corpses switch floor spawning off for a whole episode.
+        density_counts_floor_only=True,
+        # D1/D3: the real economy is 79% corpse / 21% pellet, so the reward stream
+        # must be able to tell them apart. Legacy `remains_eaten` counted all food,
+        # double-paying floor pellets and making the corpse premium unrepresentable.
+        remains_counts_corpse_only=True,
         # --- C5: ~75 u measured (distance to nearest food when an eat fires).
         # mass_mult is 0.0 because the measurement resolves a single radius and
         # says nothing about size-dependence -- inventing a slope would be

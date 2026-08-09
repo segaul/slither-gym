@@ -68,6 +68,22 @@ class WorldConfig:
     # Raising it strengthens the incentive to hunt (test: does more kill-reward → higher kill-rate).
     kill_reward_coef: float = 5.0
 
+    # --- Corpse/floor food accounting. Both default to the LEGACY behaviour so
+    # E9-E30 and frozen_eval_v1..v7 stay byte-identical. ---
+    # StepResult.remains_eaten has always been documented as "mass gained from corpse
+    # food specifically", but FoodManager.collect_near summed every pellet in radius
+    # and never read the `_is_corpse` flag it maintains. Consequences under the legacy
+    # value: floor food is paid TWICE (once via mass_delta, once via remains_eaten),
+    # and no reward term anywhere can distinguish a corpse from a pellet — so "a kill
+    # is worth ~400 pellets" (D1, the measured real economy) is not merely untuned but
+    # INEXPRESSIBLE. True restores the documented meaning.
+    remains_counts_corpse_only: bool = False
+    # When a food DENSITY target is set (food_density_per_1e6), count only floor
+    # pellets when deciding how many to top up. Counting corpse drops too (the legacy
+    # path) lets corpses satisfy the target and shut off floor spawning entirely —
+    # measured collapsing regular pellets 1737 -> 4 over 20k ticks (R1).
+    density_counts_floor_only: bool = False
+
     # ------------------------------------------------------------------
     # Sim-realism calibration (2026-08-08). Measured constants and their
     # derivations: docs/REAL_GAME_DATA.md, docs/SIM_REALISM_STATE.md.
