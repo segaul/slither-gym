@@ -78,6 +78,27 @@ class WorldConfig:
     # is worth ~400 pellets" (D1, the measured real economy) is not merely untuned but
     # INEXPRESSIBLE. True restores the documented meaning.
     remains_counts_corpse_only: bool = False
+
+    # --- D6: opponent starting-size distribution ---
+    # "fixed" (legacy): every snake spawns at initial_mass, so the population is
+    #   narrow and has no tail — realized p10 36 / p50 61 / p90 95 / max 103.
+    # "real_sct": sample from a lognormal fit to the MEASURED real distribution
+    #   (sct p10 2, p50 22, p90 178, max 262). Applies to OPPONENTS only; the
+    #   agent always starts at initial_mass so the task and eval stay comparable.
+    #
+    # Why this and not a bigger corpse constant: a corpse is already worth ~331
+    # pellets at mass 266 vs the real ~400, so the corpse VALUE is roughly right.
+    # What the sim lacks is anything big to kill — real slither concentrates mass
+    # in a few monsters whose deaths dump it. The corpse premium has to EMERGE
+    # from the size distribution; forcing it with corpse_food_scale would be
+    # fabricating a constant to manufacture a target (the E11-E30 mistake).
+    spawn_mass_law: str = "fixed"
+    # sct is initial_segments + (mass - initial_mass), so with the defaults
+    # (10, 10) sct == mass and these are directly the measured sct quantiles.
+    spawn_mass_median: float = 22.0   # measured real sct p50
+    spawn_mass_sigma: float = 1.6314  # from p90/p50 = 178/22, lognormal
+    spawn_mass_min: float = 2.0
+    spawn_mass_max: float = 262.0     # measured real max
     # When a food DENSITY target is set (food_density_per_1e6), count only floor
     # pellets when deciding how many to top up. Counting corpse drops too (the legacy
     # path) lets corpses satisfy the target and shut off floor spawning entirely —

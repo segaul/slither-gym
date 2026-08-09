@@ -109,3 +109,31 @@ def test_alive_floor_count_excludes_corpse() -> None:
         fm.spawn_at(float(i), 0.0, 2.0, corpse=True)
     assert fm.alive_count() == 6
     assert fm.alive_floor_count() == 1
+
+
+def test_spawn_mass_law_default_is_fixed() -> None:
+    """D6 must be opt-in: legacy configs spawn every snake at initial_mass."""
+    from slither_gym.core.world import World
+
+    cfg = WorldConfig(max_snakes=4)
+    assert cfg.spawn_mass_law == "fixed"
+    w = World(cfg, 0)
+    for i in range(4):
+        w.spawn_snake(i, sample_mass=True)
+    masses = {s.mass for s in w.get_snake_states().values()}
+    assert masses == {cfg.initial_mass}
+
+
+def test_spawn_mass_law_real_sct_is_heavy_tailed() -> None:
+    """Fit targets the measured real distribution: sct p10 2 / p50 22 / p90 178."""
+    from slither_gym.core.world import World
+
+    cfg = WorldConfig(max_snakes=4, spawn_mass_law="real_sct")
+    w = World(cfg, 0)
+    draws = sorted(w.sample_spawn_mass() for _ in range(20000))
+    p50 = draws[len(draws) // 2]
+    p90 = draws[int(0.9 * len(draws))]
+    assert 18.0 < p50 < 27.0, p50
+    assert 140.0 < p90 < 220.0, p90
+    assert draws[0] >= cfg.spawn_mass_min
+    assert draws[-1] <= cfg.spawn_mass_max

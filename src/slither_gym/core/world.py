@@ -84,9 +84,30 @@ class World:
         target = self._target_food_count()
         return self._config.max_food // 2 if target is None else target
 
-    def spawn_snake(self, snake_id: int, mass: float | None = None) -> None:
-        """Spawn a snake at a random position within safe zone."""
+    def sample_spawn_mass(self) -> float:
+        """D6: draw a starting mass from the measured real size distribution."""
         config = self._config
+        if config.spawn_mass_law == "fixed":
+            return config.initial_mass
+        if config.spawn_mass_law == "real_sct":
+            m = float(
+                self._rng.lognormal(math.log(config.spawn_mass_median), config.spawn_mass_sigma)
+            )
+            return min(max(m, config.spawn_mass_min), config.spawn_mass_max)
+        raise ValueError(f"unknown spawn_mass_law: {config.spawn_mass_law!r}")
+
+    def spawn_snake(
+        self, snake_id: int, mass: float | None = None, sample_mass: bool = False
+    ) -> None:
+        """Spawn a snake at a random position within safe zone.
+
+        `sample_mass=True` draws from the D6 size distribution when no explicit mass
+        is given. Callers pass it for OPPONENTS only — the agent starting big would
+        silently change the task every frozen eval is defined against.
+        """
+        config = self._config
+        if mass is None and sample_mass:
+            mass = self.sample_spawn_mass()
         angle = float(self._rng.uniform(0, 2 * math.pi))
         dist = float(config.map_radius * 0.8 * math.sqrt(self._rng.uniform(0, 1)))
         x = dist * math.cos(angle)

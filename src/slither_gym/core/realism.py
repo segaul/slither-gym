@@ -204,6 +204,10 @@ def realistic_world_config(
         # must be able to tell them apart. Legacy `remains_eaten` counted all food,
         # double-paying floor pellets and making the corpse premium unrepresentable.
         remains_counts_corpse_only=True,
+        # --- D6: measured real size distribution (sct p10 2 / p50 22 / p90 178 /
+        # max 262). Opponents only. This is what makes a corpse worth killing for:
+        # the premium comes from monsters existing, not from a corpse multiplier. ---
+        spawn_mass_law="real_sct",
         # --- C5: ~75 u measured (distance to nearest food when an eat fires).
         # mass_mult is 0.0 because the measurement resolves a single radius and
         # says nothing about size-dependence -- inventing a slope would be

@@ -121,7 +121,9 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         self._snake_cache.reset()
 
         for i in range(1 + self._num_bots):
-            self._world.spawn_snake(i)
+            # D6: opponents draw from the measured size distribution; snake 0 (the
+            # agent) always starts at initial_mass so the task stays comparable.
+            self._world.spawn_snake(i, sample_mass=(i != 0))
 
         rl_obs = self._get_rl_observation()
         self._update_bot_obs_cache()
@@ -261,7 +263,7 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             for i in range(1, 1 + self._num_bots):
                 state = self._world.get_snake_states().get(i)
                 if state is None or not state.alive:
-                    self._world.spawn_snake(i)
+                    self._world.spawn_snake(i, sample_mass=True)
                     # Reset stateful policies on respawn
                     if i in self._bot_policies and hasattr(self._bot_policies[i], 'reset'):
                         self._bot_policies[i].reset(i)
