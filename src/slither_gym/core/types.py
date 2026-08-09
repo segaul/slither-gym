@@ -147,6 +147,41 @@ class WorldConfig:
     # Measured: ~62 per 1e6 u^2.
     food_density_per_1e6: float | None = None
 
+    # --- C3/P0.3: food value distribution law ---
+    # "legacy": one uniform(food_value_min, food_value_max) draw per pellet --
+    #   byte-identical RNG stream to the pre-P0.3 sim.
+    # "real": mixture matching the MEASURED distribution (min 3.0, p25 4.8,
+    #   p50 5.2, p75 6.2, tail to 14.2, mean 6.25):
+    #     prob (1 - food_tail_weight): lognormal(mu, sigma) clipped to
+    #       [3.0, food_tail_lo]  (the bulk cluster at ~5.2)
+    #     prob food_tail_weight: uniform(food_tail_lo, food_tail_hi)
+    #       (the high-value 10-14.2 tail)
+    #   Fit (realism.py FOOD_BULK_* note): mu=1.637, sigma=0.149, w=0.153 gives
+    #   quartiles 4.74/5.32/6.14 and mean 6.253. The numeric fields below are
+    #   inert unless food_value_law == "real".
+    food_value_law: str = "legacy"
+    food_bulk_log_mu: float = 1.637
+    food_bulk_log_sigma: float = 0.149
+    food_tail_lo: float = 10.0
+    food_tail_hi: float = 14.2
+    food_tail_weight: float = 0.153
+
+    # --- D1/P0.3: corpse value law ---
+    # "legacy": one pellet per segment worth
+    #   corpse_food_base + (corpse_food_scale - base) * sqrt(mass/max_mass)
+    #   ~= 2.0-2.2, so a corpse returns roughly the victim's own mass
+    #   (~20 pellets' worth). Byte-identical to pre-P0.3.
+    # "real": total corpse value = corpse_mass_multiplier * victim mass
+    #   (measured: a real corpse is worth ~400 pellets vs the sim's ~20, i.e.
+    #   ~20x the victim's mass), split evenly across segments, with
+    #   pellets-per-segment chosen so each pellet's value lands near
+    #   corpse_pellet_value_target -- the midpoint of the observed 10-14.2
+    #   high-value tail, which is what real corpse pellets are. Total value is
+    #   conserved exactly. Inert unless corpse_value_law == "real".
+    corpse_value_law: str = "legacy"
+    corpse_mass_multiplier: float = 20.0
+    corpse_pellet_value_target: float = 12.1
+
     # --- Domain randomization over UNMEASURED / UNCONFIRMED physics ---
     # Master gate. False => sample_world_config() is a no-op and draws no RNG,
     # so eval and every existing run stay bit-identical. Presets ship honest
@@ -180,6 +215,15 @@ class WorldConfig:
     # point estimate.
     boost_mass_cost_per_tick_min: float | None = None
     boost_mass_cost_per_tick_max: float | None = None
+    # corpse_mass_multiplier: INFERRED from growth attribution (79% corpse
+    # share, +520 length in one gorge), never counted from logged kill events.
+    # Uncertainty is real and large -- the preset bands it +/-50% (10..30).
+    corpse_mass_multiplier_min: float | None = None
+    corpse_mass_multiplier_max: float | None = None
+    # food_tail_weight: solved from the mean constraint (mean 6.25), not
+    # counted directly. Preset band 0.10..0.20 (mixture mean ~5.9..~6.6).
+    food_tail_weight_min: float | None = None
+    food_tail_weight_max: float | None = None
 
 
 @dataclass

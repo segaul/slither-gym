@@ -33,9 +33,31 @@ class FoodManager:
             dist = r * np.sqrt(self._rng.uniform(0, 1))
             x = float(dist * np.cos(angle))
             y = float(dist * np.sin(angle))
+            self.spawn_at(x, y, self._sample_value(), corpse=False)
+
+    def _sample_value(self) -> float:
+        """One floor-pellet value, per config.food_value_law.
+
+        "legacy" draws exactly one uniform(min, max) -- the identical RNG call
+        the pre-P0.3 code made inline, so existing seeded runs are
+        byte-identical. "real" draws the measured cluster+tail mixture
+        (min 3.0, p25 4.8, p50 5.2, p75 6.2, tail to 14.2, mean 6.25 --
+        fit documented in core/realism.py, FOOD_BULK_* note).
+        """
+        c = self._config
+        if c.food_value_law == "legacy":
             # Most food is small, occasionally larger
-            value = float(self._rng.uniform(self._config.food_value_min, self._config.food_value_max))
-            self.spawn_at(x, y, value, corpse=False)
+            return float(self._rng.uniform(c.food_value_min, c.food_value_max))
+        if c.food_value_law == "real":
+            if self._rng.uniform() < c.food_tail_weight:
+                # High-value tail (the 10-14.2 corpse-like cluster).
+                return float(self._rng.uniform(c.food_tail_lo, c.food_tail_hi))
+            # Bulk cluster at ~5.2. Clipped to the measured support floor (3.0)
+            # and to the tail's lower edge so bulk and tail stay disjoint;
+            # both clips are ~4-sigma events with negligible mass effect.
+            v = float(self._rng.lognormal(c.food_bulk_log_mu, c.food_bulk_log_sigma))
+            return min(max(v, 3.0), c.food_tail_lo)
+        raise ValueError(f"unknown food_value_law: {c.food_value_law!r}")
 
     def spawn_at(self, x: float, y: float, value: float, corpse: bool = True) -> None:
         """Spawn a single pellet at a specific position.

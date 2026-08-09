@@ -242,16 +242,38 @@ class SnakeManager:
         end = int(self._seg_ends[snake_id])
         config = self._config
 
-        mass_ratio = min(state.mass / config.max_mass, 1.0)
-        pellet_value = config.corpse_food_base + (config.corpse_food_scale - config.corpse_food_base) * math.sqrt(mass_ratio)
-
         corpse: list[tuple[float, float, float]] = []
-        for i in range(start, end):
-            corpse.append((
-                float(segments[i, 0]),
-                float(segments[i, 1]),
-                pellet_value,
-            ))
+        if config.corpse_value_law == "legacy":
+            # Pre-P0.3 law, byte-identical: one pellet per segment worth
+            # ~2.0-2.2, so a corpse returns roughly the victim's own mass.
+            mass_ratio = min(state.mass / config.max_mass, 1.0)
+            pellet_value = config.corpse_food_base + (config.corpse_food_scale - config.corpse_food_base) * math.sqrt(mass_ratio)
+            for i in range(start, end):
+                corpse.append((
+                    float(segments[i, 0]),
+                    float(segments[i, 1]),
+                    pellet_value,
+                ))
+        elif config.corpse_value_law == "real":
+            # D1/P0.3: total corpse value = corpse_mass_multiplier * mass
+            # (measured: real corpses are worth ~20x what the legacy sim
+            # drops). The per-segment budget is split into however many
+            # pellets it takes for each pellet's value to land near
+            # corpse_pellet_value_target (12.1, the midpoint of the observed
+            # 10-14.2 high-value tail). value = budget / n conserves the
+            # total EXACTLY regardless of rounding.
+            seg_count = end - start
+            if seg_count > 0:
+                budget = config.corpse_mass_multiplier * state.mass / seg_count
+                n = max(1, round(budget / config.corpse_pellet_value_target))
+                pellet_value = budget / n
+                for i in range(start, end):
+                    x = float(segments[i, 0])
+                    y = float(segments[i, 1])
+                    for _ in range(n):
+                        corpse.append((x, y, pellet_value))
+        else:
+            raise ValueError(f"unknown corpse_value_law: {config.corpse_value_law!r}")
 
         state.alive = False
         state.segment_count = 0

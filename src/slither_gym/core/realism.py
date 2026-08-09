@@ -100,6 +100,54 @@ REAL_COLLECT_RADIUS = 75.0        # distance to nearest food when an eat fires
 REAL_FOOD_VALUE_P25 = 4.8
 REAL_FOOD_VALUE_P75 = 6.2
 
+# --- C3/P0.3: food value DISTRIBUTION LAW (supersedes the IQR-uniform stopgap)
+# Measured pellet-value distribution (8-game consolidated set):
+#   min 3.0, p25 4.8, p50 5.2, p75 6.2, tail to 14.2, MEAN 6.25.
+# Uniform cannot express "cluster + tail" (uniform(3,14) has mean 8.5, ~70% too
+# rich in equilibrium intake), so `food_value_law="real"` samples a MIXTURE:
+#   with prob (1 - w): bulk ~ lognormal(mu, sigma), clipped to [3.0, tail_lo]
+#   with prob w:       tail ~ uniform(tail_lo, tail_hi) = uniform(10.0, 14.2)
+# FIT (fixed-point iteration; converged to 3 decimals):
+#   1. Tail component: uniform(10, 14.2), mean 12.1 -- the observed high-value
+#      cluster, which the capture notes attribute to corpse food mixed into the
+#      floor population.
+#   2. Given tail weight w, the mixture quartiles map to bulk quantiles
+#      q/(1-w); least-squares fit of (mu, sigma) on ln{4.8, 5.2, 6.2} against
+#      the corresponding normal z-scores.
+#   3. w re-solved from the mean constraint
+#      (1-w)*exp(mu + sigma^2/2) + w*12.1 = 6.25, repeat from 2.
+# Converged: mu = 1.637, sigma = 0.149, w = 0.153.
+#   Realized quartiles 4.74 / 5.32 / 6.14 (targets 4.8 / 5.2 / 6.2, max
+#   residual 0.12); realized mean 6.253 (target 6.25); support [3.0, 14.2].
+# w is INFERRED from the mean, not counted directly, so it carries a DR band.
+FOOD_BULK_LOG_MU = 1.637
+FOOD_BULK_LOG_SIGMA = 0.149
+FOOD_TAIL_LO = 10.0
+FOOD_TAIL_HI = 14.2
+FOOD_TAIL_WEIGHT = 0.153
+FOOD_TAIL_WEIGHT_LO = 0.10   # mixture mean ~5.90
+FOOD_TAIL_WEIGHT_HI = 0.20   # mixture mean ~6.58
+
+# --- D1/P0.3: corpse value ---------------------------------------------------
+# Measured (3-game growth-attribution pass, docs/captains-log/2026-W32.md):
+# 79% of real growth comes from corpse bursts; one gorge = +520 length in 8.6 s
+# ~= 400 pellets' worth. The legacy sim corpse returns roughly the victim's own
+# mass (~20 pellets' worth), i.e. real corpses are worth ~20x the sim's.
+# In forage-time terms the D1 board row brackets the deficit at 5.6-20x.
+# *** NOT POINT-MEASURED ***: the 400-pellet figure is inferred from growth
+# attribution (enemies leaving view), not from logged kill events, and the
+# real-mass LUT (fpsls/fmlts) was never applied to a corpse. So the multiplier
+# ships at the top of the bracketed range with a GENEROUS +/-50% DR band.
+# A future capture must log explicit death events with the victim's sct and the
+# total mass the scavenger banked, to turn this band into a point.
+CORPSE_MASS_MULTIPLIER = 20.0       # total corpse value = multiplier * victim mass
+CORPSE_MASS_MULTIPLIER_LO = 10.0    # -50%
+CORPSE_MASS_MULTIPLIER_HI = 30.0    # +50%
+# Corpse pellets are the observed 10-14.2 tail of the value distribution;
+# 12.1 is that band's midpoint, used to pick pellets-per-segment so each
+# corpse pellet's value lands inside the measured tail.
+CORPSE_PELLET_VALUE_TARGET = 12.1
+
 # --- Fitted A3 curve -------------------------------------------------------
 # w(sct) = w_max - (w_max - w_min) * u^q,  u = clip((sct-10)/(256-10), 0, 1).
 # Least squares over REAL_TURN_RATE_BINS (grid search q in [0.30, 3.00] step
@@ -220,10 +268,23 @@ def realistic_world_config(
         body_radius_sct_divisor=REAL_SC_DIVISOR,
         # --- C4: ~62 pellets per 1e6 u^2 measured ---
         food_density_per_1e6=REAL_FOOD_DENSITY_PER_1E6,
-        # --- C3: pellet value clustered at ~5; uniform over the measured IQR
-        # (see the REAL_FOOD_VALUE_* note -- uniform(3,14) would be 70% too rich) ---
+        # --- C3/P0.3: pellet value now a DISTRIBUTION LAW (cluster ~5.2 + tail
+        # to 14.2, mean 6.25 -- see the FOOD_BULK_* fit note above). The
+        # min/max fields stay set to the measured IQR purely as the fallback
+        # for anything still reading them; the "real" law never does. ---
+        food_value_law="real",
         food_value_min=REAL_FOOD_VALUE_P25,
         food_value_max=REAL_FOOD_VALUE_P75,
+        food_bulk_log_mu=FOOD_BULK_LOG_MU,
+        food_bulk_log_sigma=FOOD_BULK_LOG_SIGMA,
+        food_tail_lo=FOOD_TAIL_LO,
+        food_tail_hi=FOOD_TAIL_HI,
+        food_tail_weight=FOOD_TAIL_WEIGHT,
+        # --- D1/P0.3: corpse worth ~20x the victim's mass (real ~400 pellets
+        # vs the legacy sim's ~20), pellets valued inside the 10-14.2 tail ---
+        corpse_value_law="real",
+        corpse_mass_multiplier=CORPSE_MASS_MULTIPLIER,
+        corpse_pellet_value_target=CORPSE_PELLET_VALUE_TARGET,
         # --- C5: ~75 u measured (distance to nearest food when an eat fires).
         # mass_mult is 0.0 because the measurement resolves a single radius and
         # says nothing about size-dependence -- inventing a slope would be
@@ -238,6 +299,12 @@ def realistic_world_config(
         boost_turn_multiplier_max=BOOST_TURN_MULTIPLIER_HI,
         body_radius_base_min=BODY_RADIUS_BASE * (1.0 - BODY_RADIUS_BASE_JITTER),
         body_radius_base_max=BODY_RADIUS_BASE * (1.0 + BODY_RADIUS_BASE_JITTER),
+        # P0.3: corpse multiplier is inferred, not counted -- +/-50% band.
+        corpse_mass_multiplier_min=CORPSE_MASS_MULTIPLIER_LO,
+        corpse_mass_multiplier_max=CORPSE_MASS_MULTIPLIER_HI,
+        # P0.3: tail weight is solved from the mean constraint, not counted.
+        food_tail_weight_min=FOOD_TAIL_WEIGHT_LO,
+        food_tail_weight_max=FOOD_TAIL_WEIGHT_HI,
         # D4 (see above): shipped as a band; the deterministic point value is
         # the mid-band 0.25 mass/s = 0.00625 mass/tick.
         boost_mass_cost_per_tick=REAL_BOOST_MASS_COST_PER_S_MID / TICK_HZ,
@@ -264,6 +331,11 @@ _RANDOMIZED_FIELDS: tuple[tuple[str, str, str], ...] = (
         "boost_mass_cost_per_tick_min",
         "boost_mass_cost_per_tick_max",
     ),
+    # P0.3: corpse value is inferred from growth attribution, not counted from
+    # logged kill events -- the widest honest band in the file (+/-50%).
+    ("corpse_mass_multiplier", "corpse_mass_multiplier_min", "corpse_mass_multiplier_max"),
+    # P0.3: the food-value tail weight is solved from the mean constraint.
+    ("food_tail_weight", "food_tail_weight_min", "food_tail_weight_max"),
 )
 
 
