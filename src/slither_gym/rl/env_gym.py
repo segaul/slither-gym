@@ -123,6 +123,10 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
 
         self._snake_cache = SnakeCache(max_slots=obs_config.k_enemies)
         self._bot_obs_cache: dict[int, dict[str, NDArray[np.float32]]] = {}
+        # Bots whose cached obs is the scripted-BotPolicy PARTIAL build (only
+        # the fields BotPolicy consumes; see _compute_bot_observation_fast).
+        # Policy-driven bots must never be fed one of these.
+        self._bot_obs_partial: set[int] = set()
         # E29 per-snake obs: distinct-k_danger ObsConfigs for opponents trained at a different
         # danger width than the agent (built lazily in _obs_config_for_bot).
         self._per_kdanger_obs_config: dict[int, ObsConfig] = {}
@@ -417,17 +421,145 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
     def _update_bot_obs_cache(self) -> None:
         assert self._world is not None
         self._bot_obs_cache.clear()
+        self._bot_obs_partial.clear()
         states = self._world.get_snake_states()
-        food_pos = self._world.get_food_positions()
-        food_vals = self._world.get_food_values()
-        food_corpse = self._world.get_food_is_corpse()
+        # Full agent-grade obs are only needed by policy-driven bots
+        # (self-play / league). Scripted BotPolicy consumes exactly
+        # self_state[2:5], enemies[:, {0,1,26,28,29,31}] and food[:, 0:3]
+        # (see _compute_bot_observation_fast), so scripted bots get the fast
+        # partial build. Compacting the food arrays is O(max_food); skip it
+        # unless some bot actually takes the full path.
+        food_pos = food_vals = food_corpse = None
+        if any(i in self._bot_policies for i in range(1, 1 + self._num_bots)):
+            food_pos = self._world.get_food_positions()
+            food_vals = self._world.get_food_values()
+            food_corpse = self._world.get_food_is_corpse()
 
         for i in range(1, 1 + self._num_bots):
             bot_state = states.get(i)
             if bot_state is None or not bot_state.alive:
                 continue
-            raw = self._build_raw_state(i, bot_state, states, food_pos, food_vals, food_corpse)
-            self._bot_obs_cache[i] = compute_observation(raw, self._obs_config_for_bot(i))
+            if i in self._bot_policies:
+                raw = self._build_raw_state(
+                    i, bot_state, states, food_pos, food_vals, food_corpse
+                )
+                self._bot_obs_cache[i] = compute_observation(raw, self._obs_config_for_bot(i))
+            else:
+                self._bot_obs_cache[i] = self._compute_bot_observation_fast(
+                    i, bot_state, states
+                )
+                self._bot_obs_partial.add(i)
+
+    def _compute_bot_observation_fast(
+        self,
+        snake_id: int,
+        state: Any,
+        all_states: dict[int, Any],
+    ) -> dict[str, NDArray[np.float32]]:
+        """Scripted-BotPolicy observation (env-throughput batch, 2026-08-09).
+
+        BotPolicy.act consumes ONLY:
+          - self_state[2] (cos), [3] (sin), [4] (log mass)
+          - enemies[:, 0-1] (rel head), [26] (log mass), [28-29] (heading),
+            [31] (is_active) — via _find_nearest_enemy
+          - food[:, 0:3] (rel x/y, value; effectively the nearest rows)
+        This builds those fields BITWISE-identical to compute_observation
+        (same float32 expressions, same candidate ordering, same argsort
+        input) and leaves everything else zero: enemy body samples (cols
+        2-25), prey, danger_segments, own_body, minimap, and the
+        self_state[8:12] compass are never read by any scripted personality.
+        The physics goldens + test_bot_obs_fast.py pin this contract; if
+        BotPolicy ever grows a new input, extend this builder (the goldens
+        will catch a silent miss as a trajectory divergence).
+
+        Cost: O(nearby pellets + n_snakes) instead of O(max_food + total
+        segments + minimap area) per bot — the old path was 36% of env time
+        at 64 bots.
+        """
+        assert self._world is not None
+        oc = self._obs_config
+        perception_radius = 500.0  # obs_processor.compute_observation constant
+        initial_mass = 10.0
+        max_segments = 256
+
+        self_state = np.zeros(12, dtype=np.float32)
+        self_state[0] = state.head_x / self._world_config.map_radius
+        self_state[1] = state.head_y / self._world_config.map_radius
+        self_state[2] = math.cos(state.angle)
+        self_state[3] = math.sin(state.angle)
+        self_state[4] = math.log(state.mass / initial_mass)
+        self_state[5] = state.speed / oc.speed_norm
+        self_state[6] = state.segment_count / max_segments
+        self_state[7] = 1.0 if state.boosting else 0.0
+        # [8:12] nearest-food/prey compass: not consumed by BotPolicy — zeros.
+
+        # --- food (floor pellets), exact _compute_food replication on the
+        # grid-candidate subset (ascending global order == compacted order).
+        food_obs = np.zeros((oc.k_food, oc.food_features), dtype=np.float32)
+        fm = self._world._food
+        cand = fm.query_candidates(state.head_x, state.head_y, perception_radius)
+        if cand.size:
+            cand = cand[~fm._is_corpse[cand]]
+        if cand.size:
+            positions = fm._positions[cand]
+            values = fm._values[cand]
+            rel = positions - np.array(
+                [state.head_x, state.head_y], dtype=np.float32
+            )
+            dists = np.sqrt(np.sum(rel * rel, axis=1))
+            within = dists < perception_radius
+            if np.any(within):
+                rel_in = rel[within]
+                dists_in = dists[within]
+                vals_in = values[within]
+                order = np.argsort(dists_in)
+                n_take = min(len(order), oc.k_food)
+                order = order[:n_take]
+                food_obs[:n_take, 0] = rel_in[order, 0] / perception_radius
+                food_obs[:n_take, 1] = rel_in[order, 1] / perception_radius
+                food_obs[:n_take, 2] = vals_in[order]
+
+        # --- enemies, exact _compute_enemies replication minus body samples
+        # (cols 2-25 stay zero). Same cull, same stable distance sort.
+        enemy_obs = np.zeros((oc.k_enemies, oc.enemy_features), dtype=np.float32)
+        cull_sq = (self._world_config.perception_radius + 300) ** 2
+        nearby: list[Any] = []
+        for other_id, other in all_states.items():
+            if not other.alive or other_id == snake_id:
+                continue
+            if other.segment_count == 0:  # == len(get_segments(id)) == 0
+                continue
+            dx = other.head_x - state.head_x
+            dy = other.head_y - state.head_y
+            if dx * dx + dy * dy > cull_sq:
+                continue
+            nearby.append(other)
+        nearby.sort(
+            key=lambda s: math.hypot(s.head_x - state.head_x, s.head_y - state.head_y)
+        )
+        for slot in range(min(len(nearby), oc.k_enemies)):
+            s = nearby[slot]
+            row = enemy_obs[slot]
+            row[0] = (s.head_x - state.head_x) / perception_radius
+            row[1] = (s.head_y - state.head_y) / perception_radius
+            row[26] = math.log(max(s.mass, 1.0) / initial_mass)
+            row[27] = s.speed / oc.speed_norm
+            row[28] = math.cos(s.angle)
+            row[29] = math.sin(s.angle)
+            row[30] = 1.0 if s.boosting else 0.0
+            row[31] = 1.0
+
+        return {
+            "self_state": self_state,
+            "food": food_obs,
+            "prey": np.zeros((oc.k_prey, oc.prey_features), dtype=np.float32),
+            "enemies": enemy_obs,
+            "danger_segments": np.zeros(
+                (oc.k_danger_segments, oc.danger_features), dtype=np.float32
+            ),
+            "own_body": np.zeros((oc.k_own_body, oc.own_body_features), dtype=np.float32),
+            "minimap": np.zeros((oc.minimap_size, oc.minimap_size), dtype=np.float32),
+        }
 
     def _obs_config_for_bot(self, i: int) -> ObsConfig:
         """Per-snake obs (E29 refactor): a policy-opponent trained at a different danger width
@@ -546,8 +678,35 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         )
 
     def set_bot_policies(self, policies: dict[int, Any]) -> None:
-        """Swap bot policies at runtime. Called by training loop for self-play."""
+        """Swap bot policies at runtime. Called by training loop for self-play.
+
+        In every existing flow this runs BETWEEN episodes (train.py calls it
+        right before collect_episode -> env.reset rebuilds the obs cache).
+        Belt-and-braces for a mid-episode swap: any newly policy-driven bot
+        whose cached obs is the scripted PARTIAL build gets a full agent-grade
+        obs rebuilt from the current world, so a neural policy can never
+        consume a partial observation."""
         self._bot_policies = policies
+        stale = [
+            i for i in policies
+            if i in self._bot_obs_partial and i in self._bot_obs_cache
+        ]
+        if stale and self._world is not None:
+            states = self._world.get_snake_states()
+            food_pos = self._world.get_food_positions()
+            food_vals = self._world.get_food_values()
+            food_corpse = self._world.get_food_is_corpse()
+            for i in stale:
+                bot_state = states.get(i)
+                if bot_state is None or not bot_state.alive:
+                    continue
+                raw = self._build_raw_state(
+                    i, bot_state, states, food_pos, food_vals, food_corpse
+                )
+                self._bot_obs_cache[i] = compute_observation(
+                    raw, self._obs_config_for_bot(i)
+                )
+                self._bot_obs_partial.discard(i)
 
     def _empty_obs(self) -> dict[str, NDArray[np.float32]]:
         if self._obs_schema == "v5":
