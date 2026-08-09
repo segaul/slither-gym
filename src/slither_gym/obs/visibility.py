@@ -3,11 +3,13 @@
 P3 (docs/STATE_SPACE_V5_PLAN.md): visibility is a measured quantity. The sim
 emits a `VisibleState` containing only what the real client would have
 delivered — food within the food window, enemy snakes whose heads are within
-the enemy window, enemy bodies decimated to ~64 u spacing — and the canonical
-`build_obs()` never sees beyond it.
+the enemy window OR whose delivered body points cross the danger window
+(measured: heads delivered to 5647 u when the body is near), enemy bodies
+decimated to ~64 u spacing — and the canonical `build_obs()` never sees
+beyond it.
 
-NOT wired into the training env yet (that is S5/S6); V4 code paths are
-untouched and E-series runs stay reproducible.
+Wired into the training envs behind the opt-in ``obs_schema='v5'`` mode (S5);
+the V4 obs path is untouched and E-series runs stay reproducible.
 """
 
 from __future__ import annotations
@@ -81,20 +83,36 @@ def visible_state_from_world(
     else:
         food = np.zeros((0, 3), dtype=np.float32)
 
-    # Enemy snakes with head within the enemy window, bodies decimated to the
-    # client's delivered ~64 u spacing.
+    # Enemy snakes delivered by the client model, bodies decimated to the
+    # client's ~64 u spacing. A snake is delivered when its HEAD is within
+    # enemy_window OR any of its DELIVERED (decimated) body points is within
+    # danger_window of our head — the real client delivers heads to 5647 u
+    # when the body crosses near us (S3 fixture: enemy id 355, head 2934 u,
+    # nearest body pt 133 u). The near-body test runs on the DECIMATED pts,
+    # matching what the client actually delivers (and what build_obs's
+    # danger channel consumes), so the sim and bridge keep-sets agree.
     enemies: list[EnemyVisible] = []
     for other_id, other in states.items():
         if other_id == snake_id or not other.alive:
             continue
-        if (
-            np.hypot(other.head_x - me.head_x, other.head_y - me.head_y)
-            >= cfg.enemy_window
-        ):
-            continue
         segs = world.get_segments(other_id)
         if len(segs) == 0:
             continue
+        pts = _decimate_pts(
+            segs, cfg.body_sample_spacing, cfg.enemy_body_max_pts
+        )
+        head_far = (
+            np.hypot(other.head_x - me.head_x, other.head_y - me.head_y)
+            >= cfg.enemy_window
+        )
+        if head_far:
+            rel_pts = pts.astype(np.float64) - head
+            if (
+                len(rel_pts) == 0
+                or float(np.hypot(rel_pts[:, 0], rel_pts[:, 1]).min())
+                >= cfg.danger_window
+            ):
+                continue
         enemies.append(EnemyVisible(
             snake_id=other_id,
             head_x=other.head_x,
@@ -102,9 +120,7 @@ def visible_state_from_world(
             angle=other.angle,
             speed=other.speed * TICK_HZ,
             sct=other.segment_count,
-            pts=_decimate_pts(
-                segs, cfg.body_sample_spacing, cfg.enemy_body_max_pts
-            ),
+            pts=pts,
         ))
 
     sc = 1.0 + (

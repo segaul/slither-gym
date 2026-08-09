@@ -483,7 +483,16 @@ def test_visible_state_from_world() -> None:
         d = np.hypot(vs.food[:, 0] - head[0], vs.food[:, 1] - head[1])
         assert np.all(d < cfg.food_window)
     for e in vs.enemies:
-        assert math.hypot(e.head_x - head[0], e.head_y - head[1]) < cfg.enemy_window
+        # delivered if head is in the enemy window OR a delivered body pt
+        # crosses the danger window (far-body fix, S5)
+        head_ok = (
+            math.hypot(e.head_x - head[0], e.head_y - head[1])
+            < cfg.enemy_window
+        )
+        body_ok = len(e.pts) > 0 and float(np.hypot(
+            e.pts[:, 0] - head[0], e.pts[:, 1] - head[1]
+        ).min()) < cfg.danger_window
+        assert head_ok or body_ok
         # decimated to the client's ~64 u spacing
         if len(e.pts) > 1:
             seg = np.diff(e.pts.astype(np.float64), axis=0)
@@ -517,3 +526,56 @@ def test_visibility_masks_far_enemy() -> None:
         assert vs.enemies == ()
     else:
         assert len(vs.enemies) == 1
+
+
+def test_visibility_keeps_far_head_near_body_snake() -> None:
+    """S5 far-body fix: a snake whose HEAD is beyond enemy_window but whose
+    body crosses the danger window must still be delivered (the real client
+    does — S3 fixture enemy id 355: head 2934 u away, body pt 133 u). Its
+    pts must then reach build_obs's danger channel while the enemies channel
+    stays head-filtered."""
+    cfg = ObsConfigV5()
+    config = WorldConfig(map_radius=10000.0, max_segments_per_snake=256)
+    world = World(config, seed=0)
+    world.spawn_snake(0)
+    world.spawn_snake(1)
+    states = world.get_snake_states()
+    me = states[0]
+
+    # Hand-place snake 1: head 3000 u away (beyond the 2500 u window), body
+    # laid straight back toward us with its tail 200 u from our head (inside
+    # the 800 u danger window).
+    st = world._snakes.get_state(1)
+    st.head_x = me.head_x + 3000.0
+    st.head_y = me.head_y
+    n_pts = 44  # 43 * 65 u ≈ 2795 u of body -> tail at ~205 u from our head
+    pts = np.stack([
+        me.head_x + 3000.0 - 65.0 * np.arange(n_pts, dtype=np.float64),
+        np.full(n_pts, me.head_y, dtype=np.float64),
+    ], axis=1).astype(np.float32)
+    start = int(world._snakes._seg_starts[1])
+    world._segments[start:start + n_pts] = pts
+    world._snakes._seg_ends[1] = start + n_pts
+
+    vs = visible_state_from_world(world, 0, cfg)
+    assert len(vs.enemies) == 1  # delivered despite the far head
+    e = vs.enemies[0]
+    d_min = float(np.hypot(
+        e.pts[:, 0] - me.head_x, e.pts[:, 1] - me.head_y
+    ).min())
+    assert d_min < cfg.danger_window
+
+    obs = build_obs(vs, cfg)
+    # danger channel sees the far-headed snake's near body points
+    active = obs["danger_segments"][np.any(obs["danger_segments"] != 0.0, axis=1)]
+    assert len(active) > 0
+    # enemies channel stays head-filtered: no active row for the far head
+    assert not np.any(obs["enemies"][:, -1] == 1.0)
+
+    # and a snake that is far in BOTH head and body is still dropped
+    st.head_x = me.head_x + 6000.0
+    far_pts = pts.copy()
+    far_pts[:, 0] += 3000.0
+    world._segments[start:start + n_pts] = far_pts
+    vs2 = visible_state_from_world(world, 0, cfg)
+    assert vs2.enemies == ()

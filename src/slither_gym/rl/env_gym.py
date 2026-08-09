@@ -10,8 +10,15 @@ from numpy.typing import NDArray
 from slither_gym.core.realism import sample_world_config
 from slither_gym.core.types import WorldConfig
 from slither_gym.core.world import World
+from slither_gym.obs.schema_v5 import ObsConfigV5
 from slither_gym.rl.action_delay import ActionDelayQueue
 from slither_gym.rl.bot_policy import BotPolicy
+from slither_gym.rl.env_obs_v5 import (
+    LastAction,
+    v5_empty_obs,
+    v5_initial_last_action,
+    v5_observe,
+)
 from slither_gym.rl.env_parallel import SlitherParallelEnv
 from slither_gym.rl.obs_processor import compute_observation
 from slither_gym.rl.reward import compute_reward
@@ -37,8 +44,19 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         render_mode: str | None = None,
         respawn_bots: bool = True,
         bot_policies: dict[int, Any] | None = None,
+        obs_schema: str = "v4",
+        obs_config_v5: ObsConfigV5 | None = None,
     ) -> None:
         super().__init__()
+        if obs_schema not in ("v4", "v5"):
+            raise ValueError(f"obs_schema must be 'v4' or 'v5', got {obs_schema!r}")
+        # S5: opt-in deployable obs for the RL AGENT ONLY. Bots always stay on
+        # the V4 obs path — scripted BotPolicy and every frozen self-play
+        # checkpoint consume V4 observations; they model other players, not
+        # the deployable agent.
+        self._obs_schema = obs_schema
+        self._obs_config_v5 = obs_config_v5 or ObsConfigV5()
+        self._last_commanded_rl: LastAction = (1.0, 0.0, 0.0)
         # The pristine config. `_world_config` is the per-episode RESOLVED one
         # (identical to this unless world_config.randomize_physics is set);
         # sampling always starts from the base so jitter cannot compound.
@@ -70,6 +88,8 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             num_agents=1 + num_bots,
             max_ticks=max_ticks,
             seed=seed,
+            obs_schema=obs_schema,
+            obs_config_v5=obs_config_v5,
         )
 
         self.observation_space = self._parallel_env.observation_space(self._rl_agent_id)
@@ -133,7 +153,11 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         # FIFO with the RL snake's spawn heading / no boost, so the first
         # `delay` ticks match an uncommanded snake exactly.
         self._action_delay = ActionDelayQueue(self._world_config.action_delay_ticks)
-        self._action_delay.seed(self._world.get_snake_states()[0].angle)
+        spawn_angle = self._world.get_snake_states()[0].angle
+        self._action_delay.seed(spawn_angle)
+        # S5: last-commanded seeds with the spawn heading / no boost, exactly
+        # like the delay queue.
+        self._last_commanded_rl = v5_initial_last_action(spawn_angle)
 
         rl_obs = self._get_rl_observation()
         self._update_bot_obs_cache()
@@ -209,6 +233,9 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         else:
             cos_a, sin_a = 1.0, 0.0
         boost = bool(action[2] > 0.5)
+        # S5: record the COMMANDED (pre-delay-queue) action; the v5 obs feeds
+        # it back as self_state[7] and [9:12] next step (env_obs_v5 docstring).
+        self._last_commanded_rl = (cos_a, sin_a, 1.0 if boost else 0.0)
 
         bot_actions: dict[int, tuple[float, float, bool]] = {}
         # Group alive, obs-cached bots by their policy object so policies that support batched
@@ -318,6 +345,12 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         rl_state = states.get(0)
         if rl_state is None or not rl_state.alive:
             return self._empty_obs()
+
+        # S5: the deployable obs path (visibility mask + canonical build_obs).
+        if self._obs_schema == "v5":
+            return v5_observe(
+                self._world, 0, self._obs_config_v5, self._last_commanded_rl
+            )
 
         food_pos = self._world.get_food_positions()
         food_vals = self._world.get_food_values()
@@ -467,6 +500,8 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         self._bot_policies = policies
 
     def _empty_obs(self) -> dict[str, NDArray[np.float32]]:
+        if self._obs_schema == "v5":
+            return v5_empty_obs(self._obs_config_v5)
         obs_config = self._obs_config
         return {
             "self_state": np.zeros(8, dtype=np.float32),
