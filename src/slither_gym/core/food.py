@@ -19,6 +19,11 @@ class FoodManager:
         self._alive = np.zeros(config.max_food, dtype=np.bool_)
         self._is_corpse = np.zeros(config.max_food, dtype=np.bool_)
         self._count: int = 0
+        # Floor (non-corpse) pellets only. R1: the C4 density top-up must
+        # target ambient floor food, not floor + corpse — otherwise a big
+        # corpse drop (20x victim mass under corpse_value_law='real')
+        # suppresses floor spawning until the corpse is eaten.
+        self._floor_count: int = 0
         self._free: list[int] = list(range(config.max_food))
 
     def spawn_batch(self, count: int) -> None:
@@ -64,13 +69,28 @@ class FoodManager:
         corpse=True for corpse drops (default), False for regular food.
         If pool is full, evicts the lowest-value alive food to make room."""
         if not self._free:
-            # Evict: find the lowest-value alive food and remove it
-            alive_indices = np.where(self._alive)[0]
-            if len(alive_indices) == 0:
+            # Evict to make room. R1: when the density feature is on
+            # (food_density_per_1e6 set), corpse pellets are protected — they
+            # are extra mass in flight, not ambient budget, and the density
+            # top-up will restore any evicted floor pellet next refresh. So
+            # evict the lowest-value FLOOR pellet first, falling back to the
+            # lowest-value corpse pellet only if no floor food is alive.
+            # When the density feature is off we keep the legacy rule
+            # (global lowest-value eviction, corpse or floor) so seeded
+            # legacy runs stay byte-identical (see test_r1_density.py).
+            if self._config.food_density_per_1e6 is not None:
+                candidates = np.where(self._alive & ~self._is_corpse)[0]
+                if len(candidates) == 0:
+                    candidates = np.where(self._alive)[0]
+            else:
+                candidates = np.where(self._alive)[0]
+            if len(candidates) == 0:
                 return
-            min_idx = int(alive_indices[np.argmin(self._values[alive_indices])])
+            min_idx = int(candidates[np.argmin(self._values[candidates])])
             self._alive[min_idx] = False
             self._count -= 1
+            if not self._is_corpse[min_idx]:
+                self._floor_count -= 1
             self._free.append(min_idx)
         idx = self._free.pop()
         self._positions[idx, 0] = x
@@ -79,6 +99,8 @@ class FoodManager:
         self._alive[idx] = True
         self._is_corpse[idx] = corpse
         self._count += 1
+        if not corpse:
+            self._floor_count += 1
 
     def collect_near(self, x: float, y: float, radius: float) -> float:
         """Remove all food within radius of (x, y). Returns total value collected."""
@@ -97,6 +119,7 @@ class FoodManager:
         hit_indices = np.where(hit)[0]
         self._alive[hit_indices] = False
         self._count -= len(hit_indices)
+        self._floor_count -= int(np.count_nonzero(~self._is_corpse[hit_indices]))
         self._free.extend(hit_indices.tolist())
 
         return total
@@ -104,6 +127,14 @@ class FoodManager:
     def alive_count(self) -> int:
         """Number of pellets currently alive (floor food + corpse drops)."""
         return self._count
+
+    def floor_count(self) -> int:
+        """Number of FLOOR (non-corpse) pellets currently alive.
+
+        R1: this is what the C4 density top-up must compare against
+        food_density_per_1e6's target — corpse pellets are transient extra
+        mass, not part of the ambient floor-food budget."""
+        return self._floor_count
 
     def get_alive_positions(self) -> NDArray[np.float32]:
         result: NDArray[np.float32] = self._positions[self._alive]

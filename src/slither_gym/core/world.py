@@ -233,7 +233,12 @@ class World:
                 # Top back up to the density target instead of adding a fixed
                 # count, so the steady-state pellet population is the measured
                 # density rather than an emergent spawn/eat equilibrium.
-                self._food.spawn_batch(max(0, target - self._food.alive_count()))
+                # R1: compare against FLOOR pellets only. Corpse pellets are
+                # extra mass in flight and must not count against the ambient
+                # budget — under corpse_value_law='real' a single big kill
+                # (20x victim mass in pellets) would otherwise suppress floor
+                # spawning until the corpse is eaten.
+                self._food.spawn_batch(max(0, target - self._food.floor_count()))
 
         # 7. Build results
         results: dict[int, StepResult] = {}
