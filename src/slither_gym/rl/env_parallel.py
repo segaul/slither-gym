@@ -9,6 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 from pettingzoo import ParallelEnv
 
+from slither_gym.core.realism import sample_world_config
 from slither_gym.core.types import WorldConfig
 from slither_gym.core.world import World
 from slither_gym.rl.obs_processor import compute_observation
@@ -34,6 +35,8 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
         render_mode: str | None = None,
     ) -> None:
         super().__init__()
+        # See SlitherGymEnv: base = pristine, _world_config = per-episode resolved.
+        self._base_world_config = world_config
         self._world_config = world_config
         self._obs_config = obs_config
         self._num_agents = num_agents
@@ -59,6 +62,12 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
     ]:
         if seed is not None:
             self._seed = seed
+        # No-op unless randomize_physics is set. This env has no persistent RNG
+        # of its own, so sample from a stream seeded off the episode seed —
+        # reproducible from (resolved config, seed) alone.
+        self._world_config = sample_world_config(
+            self._base_world_config, np.random.default_rng(self._seed)
+        )
         self._world = World(self._world_config, seed=self._seed)
         self._tick_count = 0
 

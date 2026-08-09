@@ -6,19 +6,55 @@ from numpy.typing import NDArray
 from slither_gym.core.types import SnakeState, WorldConfig
 
 
-def compute_segment_radius(mass: float, config: WorldConfig) -> float:
-    t = min(mass / config.max_mass, 1.0)
-    return config.min_segment_radius + (config.max_segment_radius - config.min_segment_radius) * math.sqrt(t)
-
-
-def compute_turn_rate(mass: float, config: WorldConfig) -> float:
-    t = min(mass / config.max_mass, 1.0)
-    return config.max_turn_rate - (config.max_turn_rate - config.min_turn_rate) * math.sqrt(t)
-
-
 def _expected_segments(mass: float, config: WorldConfig) -> int:
     """How many segments a snake should have at a given mass."""
     return max(config.initial_segments, config.initial_segments + int(mass - config.initial_mass))
+
+
+def compute_segment_radius(mass: float, config: WorldConfig) -> float:
+    """Body half-width. See WorldConfig.body_width_law."""
+    if config.body_width_law == "legacy":
+        t = min(mass / config.max_mass, 1.0)
+        return config.min_segment_radius + (config.max_segment_radius - config.min_segment_radius) * math.sqrt(t)
+    if config.body_width_law == "real_sc":
+        # Keyed on the INTEGER segment count, so the collision disc can never
+        # disagree with the number of segments actually rendered/indexed.
+        sct = min(_expected_segments(mass, config), config.max_segments_per_snake)
+        sc = 1.0 + (sct - config.body_radius_sct_offset) / config.body_radius_sct_divisor
+        return config.body_radius_base * sc
+    raise ValueError(f"unknown body_width_law: {config.body_width_law!r}")
+
+
+def max_possible_segment_radius(config: WorldConfig) -> float:
+    """Largest segment_radius any snake can reach under the active width law.
+
+    Exists so collision broad-phase and observation normalizers can state their
+    intent instead of relying on compute_segment_radius(max_mass, ...) happening
+    to saturate — under "real_sc" that only works via the segment-count clamp.
+    """
+    if config.body_width_law == "legacy":
+        return config.max_segment_radius
+    sct = config.max_segments_per_snake
+    sc = 1.0 + (sct - config.body_radius_sct_offset) / config.body_radius_sct_divisor
+    return config.body_radius_base * sc
+
+
+def compute_turn_rate(mass: float, config: WorldConfig) -> float:
+    """Angular rate in rad/tick, un-boosted. See WorldConfig.turn_rate_law."""
+    if config.turn_rate_law == "legacy":
+        t = min(mass / config.max_mass, 1.0)
+        return config.max_turn_rate - (config.max_turn_rate - config.min_turn_rate) * math.sqrt(t)
+    if config.turn_rate_law == "real_sct":
+        # Continuous in mass on purpose: _expected_segments' int() truncation
+        # would put a 1-segment-wide staircase in the angular rate. Agrees with
+        # _expected_segments exactly at integer mass.
+        sct = config.initial_segments + (mass - config.initial_mass)
+        span = config.turn_sct_ref_hi - config.turn_sct_ref_lo
+        u = (sct - config.turn_sct_ref_lo) / span
+        u = min(max(u, 0.0), 1.0)
+        blend = float(u ** config.turn_rate_exponent)
+        return config.max_turn_rate - (config.max_turn_rate - config.min_turn_rate) * blend
+    raise ValueError(f"unknown turn_rate_law: {config.turn_rate_law!r}")
 
 
 class SnakeManager:
@@ -94,16 +130,25 @@ class SnakeManager:
             return
         config = self._config
 
+        # Hoisted above the turn clamp because the clamp now depends on it (A4).
+        # Behaviour-preserving: the predicate reads only `boost`, state.mass and
+        # config.initial_mass, and nothing between here and the old site (the
+        # mass decrement) writes any of them.
+        is_boosting = bool(boost) and state.mass > config.initial_mass
+
         # Turn toward target angle
         target_angle = math.atan2(target_sin, target_cos)
         angle_diff = target_angle - state.angle
         angle_diff = math.atan2(math.sin(angle_diff), math.cos(angle_diff))
-        if abs(angle_diff) > state.turn_rate:
-            angle_diff = math.copysign(state.turn_rate, angle_diff)
+        # state.turn_rate stays the UN-boosted base rate (tests and other
+        # consumers depend on that meaning); the boost coupling lives only here.
+        max_turn = state.turn_rate * (config.boost_turn_multiplier if is_boosting else 1.0)
+        if abs(angle_diff) > max_turn:
+            angle_diff = math.copysign(max_turn, angle_diff)
         new_angle = state.angle + angle_diff
 
         # Boost
-        if boost and state.mass > config.initial_mass:
+        if is_boosting:
             speed = config.boost_speed
             state.mass -= config.boost_mass_cost_per_tick
             state.mass = max(state.mass, config.initial_mass)

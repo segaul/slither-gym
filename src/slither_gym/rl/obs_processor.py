@@ -58,7 +58,7 @@ def compute_observation(
         math.cos(state.self_angle),
         math.sin(state.self_angle),
         math.log(state.self_mass / initial_mass),
-        state.self_speed,
+        state.self_speed / obs_config.speed_norm,
         state.self_segment_count / max_segments,
         1.0 if state.self_boosting else 0.0,
         nearest_food_dx,
@@ -195,7 +195,7 @@ def _compute_enemies(
         # [26] log(mass / 10)
         row[26] = math.log(max(info.mass, 1.0) / initial_mass)
         # [27] speed
-        row[27] = info.speed
+        row[27] = info.speed / obs_config.speed_norm
         # [28-29] heading direction
         row[28] = math.cos(info.angle)
         row[29] = math.sin(info.angle)
@@ -235,7 +235,7 @@ def _compute_danger_segments(
 
     danger_obs[:n_take, 0] = rel_in[order, 0] / perception_radius
     danger_obs[:n_take, 1] = rel_in[order, 1] / perception_radius
-    danger_obs[:n_take, 2] = radius_in[order] / 20.0
+    danger_obs[:n_take, 2] = radius_in[order] / obs_config.danger_radius_norm
 
     return danger_obs
 

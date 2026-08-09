@@ -33,6 +33,18 @@ class ObsConfig:
     danger_features: int = 3       # rel_x, rel_y, radius
     own_body_features: int = 2     # rel_x, rel_y
     minimap_size: int = 64         # NxN grid covering the circular map
+    # --- Normalizers bound to the world's physics constants. ---
+    # Defaults reproduce the previously hard-coded arithmetic exactly.
+    # REQUIRED COMPANION to the speed recalibration, not optional: self_state[5]
+    # and enemy row[27] carry RAW per-tick speed, so raising base/boost speed
+    # 3.0/6.0 -> 4.525/9.5 would multiply two encoder inputs by 1.51x/1.58x with
+    # no other change. Set this to WorldConfig.base_speed and the feature reads
+    # 1.0 at base speed and 2.099 while boosting, whatever the calibration.
+    speed_norm: float = 1.0
+    # Divisor for danger_segments[:, 2] (enemy body half-width). MUST equal
+    # max_possible_segment_radius(world_config): under the "real_sc" width law
+    # the true max is 22.076, so leaving 20.0 would emit values above 1.0.
+    danger_radius_norm: float = 20.0
 
 
 @dataclass(frozen=True)

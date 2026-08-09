@@ -7,6 +7,7 @@ import gymnasium
 import numpy as np
 from numpy.typing import NDArray
 
+from slither_gym.core.realism import sample_world_config
 from slither_gym.core.types import WorldConfig
 from slither_gym.core.world import World
 from slither_gym.rl.bot_policy import BotPolicy
@@ -37,6 +38,10 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         bot_policies: dict[int, Any] | None = None,
     ) -> None:
         super().__init__()
+        # The pristine config. `_world_config` is the per-episode RESOLVED one
+        # (identical to this unless world_config.randomize_physics is set);
+        # sampling always starts from the base so jitter cannot compound.
+        self._base_world_config = world_config
         self._world_config = world_config
         self._obs_config = obs_config
         self._num_bots = num_bots
@@ -95,6 +100,18 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         if seed is not None:
             self._seed = seed
             self._rng = np.random.default_rng(seed)
+
+        # Resolve this episode's physics from the PRISTINE base config, so
+        # randomization cannot compound across resets. Returns the same object
+        # and draws no RNG unless randomize_physics is set, which keeps every
+        # pre-existing run's RNG stream bit-identical.
+        resolved = sample_world_config(self._base_world_config, self._rng)
+        config_changed = resolved is not self._world_config
+        self._world_config = resolved
+
+        # Rebuilding BotPolicy consumes RNG, so only do it on the paths that
+        # already did (a reseed) plus the new randomized-physics path.
+        if seed is not None or config_changed:
             self._bot_policy = BotPolicy(
                 self._world_config, self._rng, bot_difficulty=self._bot_difficulty_override
             )

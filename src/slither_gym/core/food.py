@@ -79,6 +79,10 @@ class FoodManager:
 
         return total
 
+    def alive_count(self) -> int:
+        """Number of pellets currently alive (floor food + corpse drops)."""
+        return self._count
+
     def get_alive_positions(self) -> NDArray[np.float32]:
         result: NDArray[np.float32] = self._positions[self._alive]
         return result

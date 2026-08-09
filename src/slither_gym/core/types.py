@@ -14,11 +14,17 @@ class WorldConfig:
     max_snakes: int = 48
     max_segments_per_snake: int = 256
     max_food: int = 16384
-    base_speed: float = 3.0
-    boost_speed: float = 6.0
+    base_speed: float = 3.0  # u/tick; 120 u/s at 40Hz. Real: 181.5 u/s -> 4.5375 (realism.py)
+    boost_speed: float = 6.0  # u/tick; 240 u/s. Real: 373 u/s -> 9.325 (realism.py)
     boost_mass_cost_per_tick: float = 0.125  # 5 segments/sec at 40Hz
-    max_turn_rate: float = 0.15  # radians per tick at minimum mass
-    min_turn_rate: float = 0.02  # radians per tick at max mass
+    # Endpoints of the size->agility curve, in radians per tick. Their MEANING
+    # depends on turn_rate_law (below):
+    #   "legacy"   -> at minimum mass / at max_mass
+    #   "real_sct" -> at sct == turn_sct_ref_lo / turn_sct_ref_hi
+    # NOTE: scripts/analyze_probe.py and scripts/replay_dynamics.py hard-code
+    # the legacy 0.15/0.02 and will print stale comparisons under "real_sct".
+    max_turn_rate: float = 0.15
+    min_turn_rate: float = 0.02
     segment_spacing: float = 5.0
     step_mul: int = 4  # physics ticks per RL decision
     initial_mass: float = 10.0
@@ -58,6 +64,111 @@ class WorldConfig:
     # foraging suboptimal — the E14 reform.
     gorge_bonus_coef: float = 0.0
     gorge_threshold: float = 5.0  # corpse-mass eaten in one tick that counts as a "big gulp" of prey
+    # E24: reward per confirmed kill. Default 5.0 = byte-identical to E9–E23 (the +5 kill term).
+    # Raising it strengthens the incentive to hunt (test: does more kill-reward → higher kill-rate).
+    kill_reward_coef: float = 5.0
+
+    # ------------------------------------------------------------------
+    # Sim-realism calibration (2026-08-08). Measured constants and their
+    # derivations: docs/REAL_GAME_DATA.md, docs/SIM_REALISM_STATE.md.
+    #
+    # EVERY DEFAULT BELOW REPRODUCES PRE-CALIBRATION BEHAVIOUR EXACTLY.
+    # The measured values live in core/realism.py; apply them by building a
+    # config with realism.realistic_world_config() rather than by editing
+    # these defaults. E9-E30 and frozen_eval_v1..v7 must stay reproducible.
+    # ------------------------------------------------------------------
+
+    # --- A3: mass -> agility law ---
+    # "legacy": turn = max - (max-min)*sqrt(mass/max_mass). Effectively flat over
+    #   the reachable size range (5.92 -> 5.58 rad/s), because the knee of
+    #   sqrt(mass/40000) sits ~40-150x beyond the 256-segment cap.
+    # "real_sct": turn = max - (max-min)*u^q, u = clip((sct-lo)/(hi-lo), 0, 1).
+    #   Fit to the measured p95 turn-rate-vs-sct table (real span 1.9x).
+    turn_rate_law: str = "legacy"
+    # Fit exponent q. Least-squares over the six measured sct bins
+    # (grid search q in [0.30, 3.00] step 0.01, w_max/w_min solved linearly at
+    # each q). Only read when turn_rate_law == "real_sct".
+    turn_rate_exponent: float = 0.79
+    # sct anchors for the real_sct blend. Deliberately NOT reusing
+    # initial_segments / max_segments_per_snake so the fitted curve cannot move
+    # silently if those unrelated fields are retuned (config-provenance).
+    turn_sct_ref_lo: float = 10.0   # sct at which turn rate == max_turn_rate
+    turn_sct_ref_hi: float = 256.0  # sct at which turn rate == min_turn_rate
+
+    # --- A4: boost maneuverability ---
+    # Angular-rate factor while boosting. READ THIS BEFORE "FIXING" ITS SIGN:
+    # the sim clamps ANGULAR rate, so turn radius is the emergent quotient
+    # speed/omega, and boosting ALREADY inflates the radius by the full speed
+    # ratio (2.0551x under the realistic preset) with NO extra term. The
+    # measured inflation is 46u -> 99-106u = ~2.2x, only slightly more, so the
+    # residual angular penalty is mild: 2.0551 / 2.2 = 0.934 (realism.py).
+    # The original brief's guess of a 1/1.7 = 0.59 penalty would double-count
+    # the emergent part; a first-pass reading of 1.234 (a BONUS) came from a
+    # boost-detection bug that has since been retracted.
+    # 1.0 = legacy (boost has no effect on angular rate whatsoever).
+    boost_turn_multiplier: float = 1.0
+
+    # --- B1: body width law ---
+    # "legacy": radius = min_segment_radius + (max-min)*sqrt(mass/max_mass).
+    #   Reachable span is only 3.269 -> 4.362 u (1.33x) because 20.0 u is
+    #   attained only at mass 40000, which the 256-segment cap makes
+    #   unreachable. The defect is that the sim is too FLAT, not too fat.
+    # "real_sc": radius = body_radius_base * sc, sc = 1 + (sct - offset)/divisor.
+    #   The sc law is measured EXACTLY (zero residual, 94 distinct sizes,
+    #   sct 2-262, real width span 3.45x).
+    body_width_law: str = "legacy"
+    # R0 = half-width in world units at sc == 1 (sct == 2). *** NOT MEASURED ***
+    # The capture set gives only the dimensionless width RATIO, never an
+    # absolute half-width. 6.5 is an ANCHOR, pinned by preserving the
+    # scale-free ratio (spawn half-width)/(min turn radius) = 0.1634 across the
+    # A-block recalibration. It assumes A1+A3 also apply; see realism.py.
+    # Randomize it (body_radius_base_min/max) for any run whose conclusion
+    # depends on absolute body width.
+    body_radius_base: float = 6.5
+    body_radius_sct_offset: float = 2.0     # measured: sc = 1 + (sct - 2)/106
+    body_radius_sct_divisor: float = 106.0  # measured: exact over sct 2-262
+
+    # --- C4: food density as a scale-free quantity ---
+    # Pellets per 1e6 u^2. None = legacy absolute counts (max_food//2 at reset,
+    # then food_spawn_rate pellets every food_refresh_interval ticks). When set,
+    # the pellet population is held at density * pi * map_radius^2 / 1e6, so
+    # food does not silently vanish or explode when map_radius is dialled.
+    # Measured: ~62 per 1e6 u^2.
+    food_density_per_1e6: float | None = None
+
+    # --- Domain randomization over UNMEASURED / UNCONFIRMED physics ---
+    # Master gate. False => sample_world_config() is a no-op and draws no RNG,
+    # so eval and every existing run stay bit-identical. Presets ship honest
+    # ranges with this OFF; training turns it on, the frozen eval never does.
+    randomize_physics: bool = False
+    # Each range is (min, max); None on either side, or max <= min, means "not
+    # randomized, use the point-valued field above".
+    # map_radius: grd=32550 is ASSUMED to be the radius (docs/REAL_GAME_DATA.md
+    # sec.6). The only two defensible readings are radius=grd and radius=grd/2,
+    # so the realistic range spans exactly those two hypotheses.
+    map_radius_min: float | None = None
+    map_radius_max: float | None = None
+    # boost_turn_multiplier: rests on exactly two scalars (40u / 68u) whose
+    # sample sizes and size-composition are unreported. If the boosting sample
+    # skews small the true value could be as low as 1.0 (no A4 at all).
+    boost_turn_multiplier_min: float | None = None
+    boost_turn_multiplier_max: float | None = None
+    # body_radius_base: see the R0 note above -- this one is not measured at all.
+    body_radius_base_min: float | None = None
+    body_radius_base_max: float | None = None
+    # segment_spacing: the real trend (~27u at sct 10 -> ~18u at sct 100) is
+    # UNVERIFIED and its direction is physically backwards for a chain, so it is
+    # suspected to be a capture-stride artifact. NOT adopted. See the
+    # tube-continuity assert in World.__init__ before widening this.
+    segment_spacing_min: float | None = None
+    segment_spacing_max: float | None = None
+    # boost_mass_cost_per_tick: BOUNDED, NOT POINT-MEASURED. Three reduction
+    # methods disagree (-0.27..-0.52 / ~-0.11 / nonsense), giving a consensus
+    # band of -0.1..-0.5 mass/s against the sim's -5.0 (10-50x too high). Not
+    # further resolvable from natural play, so it ships as a range, never a
+    # point estimate.
+    boost_mass_cost_per_tick_min: float | None = None
+    boost_mass_cost_per_tick_max: float | None = None
 
 
 @dataclass

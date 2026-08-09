@@ -4,7 +4,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from slither_gym.core.food import FoodManager
-from slither_gym.core.snake import SnakeManager, compute_segment_radius
+from slither_gym.core.snake import (
+    SnakeManager,
+    compute_segment_radius,
+    max_possible_segment_radius,
+)
 from slither_gym.core.spatial_hash import SpatialHash
 from slither_gym.core.types import SnakeState, StepResult, WorldConfig
 
@@ -28,13 +32,57 @@ class World:
         self._snakes = SnakeManager(config)
         self._food = FoodManager(config, self._rng)
 
-        cell_size = compute_segment_radius(config.max_mass, config) * 4
+        # Under "legacy" this is 20.0*4 = 80.0, byte-identical to the old
+        # compute_segment_radius(max_mass, config)*4.
+        max_radius = max_possible_segment_radius(config)
+        cell_size = max_radius * 4
         self._spatial = SpatialHash(
             cell_size=cell_size,
             bounds=config.map_radius,
         )
 
-        self._food.spawn_batch(config.max_food // 2)
+        # --- Discretization invariants. The collision model is a chain of discs
+        # sampled at segment CENTERS and the head teleports `speed` u per tick;
+        # both are only faithful within these bounds. They hold for every config
+        # shipped today, and fail loudly rather than silently corrupting kills.
+        min_radius = compute_segment_radius(config.initial_mass, config)
+        assert config.segment_spacing <= 2.0 * min_radius, (
+            f"segment_spacing {config.segment_spacing} exceeds 2x min body radius "
+            f"{min_radius:.4f}: the body has gaps between segment discs and heads "
+            f"will tunnel through it. Adopting the real 18-27u spacing requires "
+            f"replacing the disc-chain narrow phase with a capsule test first."
+        )
+        assert config.boost_speed <= 2.0 * min_radius, (
+            f"boost_speed {config.boost_speed} exceeds 2x min body radius "
+            f"{min_radius:.4f}: a boosting head steps further than the thinnest "
+            f"body is thick and can jump clean through it without registering a "
+            f"hit (the collision test is point-vs-point, not swept)."
+        )
+
+        self._food.spawn_batch(self._initial_food_count())
+
+    def _target_food_count(self) -> int | None:
+        """Pellet population implied by food_density_per_1e6, or None for the
+        legacy absolute-count regime.
+
+        Density is the scale-free form: it keeps food-per-unit-area fixed when
+        map_radius is dialled, which is what makes world scale a usable knob.
+        Measured: ~62 pellets per 1e6 u^2 (docs/REAL_GAME_DATA.md).
+        """
+        config = self._config
+        if config.food_density_per_1e6 is None:
+            return None
+        area = math.pi * config.map_radius ** 2
+        target = int(round(config.food_density_per_1e6 * area / 1e6))
+        # FoodManager reserves the top quarter of the pool for corpse drops, so
+        # that is the true ceiling. At the real map radius (32550) the measured
+        # density implies ~206k pellets against a 16384 pool -- the pool, not
+        # the density, is what binds there. Raise max_food to lift it.
+        return max(0, min(target, config.max_food * 3 // 4))
+
+    def _initial_food_count(self) -> int:
+        target = self._target_food_count()
+        return self._config.max_food // 2 if target is None else target
 
     def spawn_snake(self, snake_id: int, mass: float | None = None) -> None:
         """Spawn a snake at a random position within safe zone."""
@@ -118,8 +166,17 @@ class World:
                 killed[sid] = None
                 continue
 
+            # The narrow phase below tests dist < head_radius + other.radius, so
+            # the broad phase MUST reach head_radius + max(other radius) or kills
+            # are silently missed. Under "real_sc" the true max is 22.076 while
+            # config.max_segment_radius is still 20.0 (legacy-only), which would
+            # drop head-on hits against the largest snakes.
+            # The min() can never bind: query_radius <= 2*Rmax and
+            # cell_size == 4*Rmax, so the SpatialHash radius assert is safe too.
             head_radius = state.segment_radius
-            query_radius = min(head_radius + config.max_segment_radius, self._spatial._cell_size)
+            query_radius = min(
+                head_radius + max_possible_segment_radius(config), self._spatial._cell_size
+            )
 
             hits = self._spatial.query_near(
                 state.head_x, state.head_y, query_radius, exclude_snake_id=sid
@@ -169,7 +226,14 @@ class World:
         # 6. Batch-spawn food
         self._tick += 1
         if self._tick % config.food_refresh_interval == 0:
-            self._food.spawn_batch(config.food_spawn_rate)
+            target = self._target_food_count()
+            if target is None:
+                self._food.spawn_batch(config.food_spawn_rate)
+            else:
+                # Top back up to the density target instead of adding a fixed
+                # count, so the steady-state pellet population is the measured
+                # density rather than an emergent spawn/eat equilibrium.
+                self._food.spawn_batch(max(0, target - self._food.alive_count()))
 
         # 7. Build results
         results: dict[int, StepResult] = {}
