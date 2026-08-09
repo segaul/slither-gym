@@ -8,12 +8,21 @@ def compute_reward(
     snake_state: SnakeState,
     config: WorldConfig,
 ) -> float:
-    """Pure function. Computes scalar reward from a single tick's outcome."""
+    """Pure function. Computes scalar reward from a single tick's outcome.
+
+    E32 pre-launch fix (2026-08-09): food/corpse intake pays exactly ONCE,
+    through mass_delta. `remains_eaten` is the food value collected this tick
+    (world.py step 5) and that same collected mass is already inside
+    mass_delta (grow() raises mass before mass_delta = mass - initial_mass),
+    so the old `+ remains_eaten` term double-paid every unit of intake.
+    remains_eaten stays on StepResult for metrics and the gorge bonus below.
+    kill_count now pays config.kill_reward_coef (plumbed from
+    env_factory / WorldConfig; default 5.0 = the historical hard-coded value).
+    """
     reward: float = 0.0
 
     reward += result.mass_delta * 1.0
-    reward += result.remains_eaten * 1.0
-    reward += result.kill_count * 5.0
+    reward += result.kill_count * config.kill_reward_coef
     reward += config.survival_bonus
 
     # E15: gorge bonus — eating a big chunk of corpse AT ONCE (= consuming prey/a kill) pays extra,

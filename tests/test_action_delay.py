@@ -28,10 +28,21 @@ from slither_gym.rl.env_parallel import SlitherParallelEnv
 # 1. Legacy (delay 0) byte-identity
 # --------------------------------------------------------------------------
 
-# Golden fingerprints captured by running these exact scenarios on the
-# pre-S4 code (commit 8967a70), before any action-delay plumbing existed.
-_GOLDEN_GYM = "c36cbfc2c58325b4ca0da67eafcc5ff4129b472e5f7fc74be53eeb32765b70d7"
-_GOLDEN_PARALLEL = "4b328c2417b9dd2ace8a906af9820e083b0151b6cce0db98908f32b80b4dbc84"
+# Golden fingerprints originally captured on the pre-S4 code (commit 8967a70),
+# before any action-delay plumbing existed:
+#   gym      c36cbfc2c58325b4ca0da67eafcc5ff4129b472e5f7fc74be53eeb32765b70d7
+#   parallel 4b328c2417b9dd2ace8a906af9820e083b0151b6cce0db98908f32b80b4dbc84
+# Re-captured 2026-08-09 for the E32 pre-launch reward fix (rl/reward.py:
+# remains_eaten double-pay removed; kill_reward_coef wired from config with an
+# unchanged default of 5.0). These fingerprints fold the REWARD stream in, so
+# they legitimately move with that fix. The state-only trajectory (head_x/y,
+# angle, mass — everything else these hashes cover) was verified bitwise
+# IDENTICAL before and after the reward change:
+#   gym      state-only f2e2b3f8d3bb70814a0cedb0f530a19d8364a5cb35c336f78927a3441ef205e6
+#   parallel state-only c97f8204ba11d6a05b78d85cd08a596c8a43209af34b96723e7598b404ea29dc
+# so the S4 zero-delay byte-identity claim (physics/trajectory) still holds.
+_GOLDEN_GYM = "70a328ab8fe782a3bc6cace3b1a589d2f3f0547283622e88839aaa407308e464"
+_GOLDEN_PARALLEL = "fc62f721bd9762b5ae2c119c139084f8b11660965977ab16c58d8f9df2f76872"
 
 
 def _gym_fingerprint(cfg: WorldConfig) -> str:
