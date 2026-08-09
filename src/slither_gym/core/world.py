@@ -273,3 +273,7 @@ class World:
 
     def get_tick(self) -> int:
         return self._tick
+
+    def get_config(self) -> WorldConfig:
+        """Read-only view of the resolved config this world was built with."""
+        return self._config
