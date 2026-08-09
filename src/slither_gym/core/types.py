@@ -128,6 +128,17 @@ class WorldConfig:
     body_radius_sct_offset: float = 2.0     # measured: sc = 1 + (sct - 2)/106
     body_radius_sct_divisor: float = 106.0  # measured: exact over sct 2-262
 
+    # --- A2b: boost acceleration ramp (P0.2 follow-on, measured on the F1 ruler) ---
+    # Real slither.io does NOT jump to boost speed instantly: measured on the
+    # 8-game captures, speed ramps ~linearly 181.5 -> ~380 u/s over ~12 client
+    # frames (~0.40 s, ~469 u/s^2), while RELEASE drops to base speed within one
+    # frame. The instant-onset model left every boost onset ~40 u AHEAD of the
+    # real snake (2s pos err p50 45 u on boost windows vs 6.8 u non-boost).
+    # None = legacy instant onset (byte-identical for E9-E30 / frozen evals).
+    # When set: per-tick cap on speed INCREASE (u/tick per tick); decreases stay
+    # instant. 469 u/s^2 at 40 Hz = 469/1600 = 0.2931 u/tick^2 (realism.py).
+    boost_ramp_up_per_tick: float | None = None
+
     # --- C4: food density as a scale-free quantity ---
     # Pellets per 1e6 u^2. None = legacy absolute counts (max_food//2 at reset,
     # then food_spawn_rate pellets every food_refresh_interval ticks). When set,

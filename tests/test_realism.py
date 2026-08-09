@@ -273,6 +273,38 @@ def test_c4_food_density_is_scale_free(radius: float) -> None:
     assert world._food.alive_count() == pytest.approx(expected, rel=0.01)
 
 
+def test_a2b_boost_ramp_matches_the_measured_spin_up() -> None:
+    """Onset ramp 469 u/s^2 -> 0.2931 u/tick^2; full 181.5 -> 373 u/s spin-up
+    in ceil((9.325-4.5375)/0.2931) = 17 ticks (~0.41 s). Legacy default: None."""
+    c = realistic_world_config()
+    assert c.boost_ramp_up_per_tick == pytest.approx(469.0 / 1600.0)
+    ticks_to_full = math.ceil((c.boost_speed - c.base_speed) / c.boost_ramp_up_per_tick)
+    assert ticks_to_full == 17  # ~0.41 s at 40 Hz, matching the measured ~0.40 s
+    assert WorldConfig().boost_ramp_up_per_tick is None
+
+
+def test_c3_food_value_is_the_measured_iqr_uniform() -> None:
+    """Real pellet value clusters at ~5 (p25 4.8, p75 6.2, thin tail to ~14).
+    A uniform draw cannot express the cluster+tail shape, so the preset ships
+    the IQR as the uniform range (mean 5.5); the legacy 1-3 stays untouched."""
+    c = realistic_world_config()
+    assert (c.food_value_min, c.food_value_max) == (4.8, 6.2)
+    lc = WorldConfig()
+    assert (lc.food_value_min, lc.food_value_max) == (1.0, 3.0)
+
+
+def test_d4_boost_cost_point_is_mid_band() -> None:
+    """D4 is a band (-0.1..-0.5 mass/s); the deterministic point value sits at
+    the band centre-of-belief 0.25 mass/s = 0.00625 mass/tick, not the cheapest
+    edge, and the DR range still spans the full band."""
+    c = realistic_world_config()
+    assert c.boost_mass_cost_per_tick == pytest.approx(0.00625)
+    assert c.boost_mass_cost_per_tick_min == pytest.approx(0.1 / 40)
+    assert c.boost_mass_cost_per_tick_max == pytest.approx(0.5 / 40)
+    # Legacy default untouched (10-50x too high, but frozen for E-series).
+    assert WorldConfig().boost_mass_cost_per_tick == 0.125
+
+
 def test_c4_legacy_food_regime_is_untouched() -> None:
     c = WorldConfig()
     assert World(c, seed=0)._food.alive_count() == c.max_food // 2

@@ -130,11 +130,16 @@ class SnakeManager:
             return
         config = self._config
 
-        # Hoisted above the turn clamp because the clamp now depends on it (A4).
-        # Behaviour-preserving: the predicate reads only `boost`, state.mass and
-        # config.initial_mass, and nothing between here and the old site (the
-        # mass decrement) writes any of them.
-        is_boosting = bool(boost) and state.mass > config.initial_mass
+        # Hoisted above the turn clamp because the clamp depends on it (A4).
+        #
+        # P0.2 (state-space V5): boost ALWAYS engages when commanded. The old
+        # predicate `boost and mass > initial_mass` refused boost at floor mass,
+        # which dropped 99% of commanded boost ticks in real-capture replays
+        # (humans boost constantly at sct 2-6, which maps to the sim's floor).
+        # Real slither.io lets any snake at/above spawn mass boost; the floor
+        # only stops the DRAIN, not the boost itself. That semantics lives in
+        # the mass clamp below; above the floor, behaviour is identical.
+        is_boosting = bool(boost)
 
         # Turn toward target angle
         target_angle = math.atan2(target_sin, target_cos)
@@ -149,13 +154,24 @@ class SnakeManager:
 
         # Boost
         if is_boosting:
-            speed = config.boost_speed
+            target_speed = config.boost_speed
+            # Drain clamps at spawn mass: boosting at the floor costs nothing
+            # but still moves at boost_speed (P0.2, matches real slither.io).
             state.mass -= config.boost_mass_cost_per_tick
             state.mass = max(state.mass, config.initial_mass)
             state.boosting = True
         else:
-            speed = config.base_speed
+            target_speed = config.base_speed
             state.boosting = False
+
+        # A2b boost ramp: speed INCREASES are rate-limited (measured ~469 u/s^2
+        # onset ramp); decreases are instant (measured: release drops to base
+        # within one client frame). None = legacy instant onset, byte-identical.
+        ramp = config.boost_ramp_up_per_tick
+        if ramp is not None and target_speed > state.speed:
+            speed = min(state.speed + ramp, target_speed)
+        else:
+            speed = target_speed
 
         # Advance head
         new_hx = state.head_x + math.cos(new_angle) * speed

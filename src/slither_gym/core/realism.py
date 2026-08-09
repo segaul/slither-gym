@@ -43,6 +43,14 @@ TICK_HZ = 40.0
 # the drift is a separate unit and is NOT done here.
 REAL_BASE_SPEED_PER_S = 181.5
 REAL_BOOST_SPEED_PER_S = 373.0  # 8-game value; boost/base ratio 2.0551
+# A2b: boost ONSET is not instant. Median speed profile inside 94 long
+# (>= 30-frame) boost runs ramps ~linearly 182 -> ~380 u/s over ~12 client
+# frames (~0.40 s): slope (380 - 193.8) / (12 * 0.0331 s) = 469 u/s^2.
+# RELEASE is instant (first post-boost frame is already back at ~182 u/s).
+# A brief ~438 u/s overshoot at frames 16-20 is real in the median profile but
+# NOT modelled -- one extra state variable for a ~15% transient. Measured
+# 2026-08-09 on the 8-game captures via the F1 replay ruler.
+REAL_BOOST_RAMP_PER_S2 = 469.0
 # Min turn radius. The base figure is reported two ways: 40 u as a single-frame
 # extreme and 46 u from the clean (boost-corrected) re-measure. The RATIO is the
 # well-determined quantity, not the absolutes -- see BOOST_TURN_MULTIPLIER.
@@ -82,6 +90,15 @@ REAL_MAP_RADIUS = 15000.0
 REAL_WORLD_CENTRE = 32550.0  # grd; the real->sim bridge must subtract this
 REAL_FOOD_DENSITY_PER_1E6 = 62.0  # pellets per 1e6 u^2
 REAL_COLLECT_RADIUS = 75.0        # distance to nearest food when an eat fires
+# C3: pellet VALUE. Measured distribution is clustered at ~5.0 (p25 4.8,
+# p75 6.2) with a thin tail out to ~14.6 (full range ~3-14). The config only
+# supports a UNIFORM min..max draw, which cannot express "clustered with a
+# tail": uniform(3, 14) would have mean 8.5, 70% too rich. So the preset ships
+# the measured INTERQUARTILE band as the uniform range -- mean 5.5, matching
+# where the real mass actually sits. Widening to the full 3-14 range needs a
+# distribution law on FoodManager first (P0.3 follow-up), not a wider uniform.
+REAL_FOOD_VALUE_P25 = 4.8
+REAL_FOOD_VALUE_P75 = 6.2
 
 # --- Fitted A3 curve -------------------------------------------------------
 # w(sct) = w_max - (w_max - w_min) * u^q,  u = clip((sct-10)/(256-10), 0, 1).
@@ -130,8 +147,11 @@ BOOST_TURN_MULTIPLIER_HI = 0.955
 # records this as NOT further resolvable from natural play -- food density is
 # high enough (one eat every 0.33 s while boosting) that no uncontaminated
 # window exists. So it ships as a RANGE and never as a point estimate; the
-# deterministic value is the conservative (cheapest-boost) end of the band.
+# deterministic point value is the band's centre-of-belief 0.25 mass/s
+# (0.00625 mass/tick — the V5 plan's mid-band figure), so a non-randomized
+# run sits inside the band instead of pinned to its cheapest edge.
 REAL_BOOST_MASS_COST_PER_S_LO = 0.1
+REAL_BOOST_MASS_COST_PER_S_MID = 0.25
 REAL_BOOST_MASS_COST_PER_S_HI = 0.5
 
 # --- B1: R0, the one dimensional body-width quantity -----------------------
@@ -180,6 +200,9 @@ def realistic_world_config(
         # --- A2: 373 u/s measured / 40 Hz. boost/base = 2.0551, matching the
         # measured 373/181.5 exactly, so neither constant hides work ---
         boost_speed=REAL_BOOST_SPEED_PER_S / TICK_HZ,    # 9.325 u/tick
+        # --- A2b: measured 469 u/s^2 onset ramp -> 0.2931 u/tick^2 at 40 Hz.
+        # Full 181.5 -> 373 spin-up takes (373-181.5)/469 = 0.41 s = 16 ticks ---
+        boost_ramp_up_per_tick=REAL_BOOST_RAMP_PER_S2 / (TICK_HZ * TICK_HZ),
         # --- A3: refit size->agility curve ---
         turn_rate_law="real_sct",
         max_turn_rate=FIT_TURN_RATE_MAX_PER_S / TICK_HZ,  # 0.1065 rad/tick
@@ -197,6 +220,10 @@ def realistic_world_config(
         body_radius_sct_divisor=REAL_SC_DIVISOR,
         # --- C4: ~62 pellets per 1e6 u^2 measured ---
         food_density_per_1e6=REAL_FOOD_DENSITY_PER_1E6,
+        # --- C3: pellet value clustered at ~5; uniform over the measured IQR
+        # (see the REAL_FOOD_VALUE_* note -- uniform(3,14) would be 70% too rich) ---
+        food_value_min=REAL_FOOD_VALUE_P25,
+        food_value_max=REAL_FOOD_VALUE_P75,
         # --- C5: ~75 u measured (distance to nearest food when an eat fires).
         # mass_mult is 0.0 because the measurement resolves a single radius and
         # says nothing about size-dependence -- inventing a slope would be
@@ -211,9 +238,9 @@ def realistic_world_config(
         boost_turn_multiplier_max=BOOST_TURN_MULTIPLIER_HI,
         body_radius_base_min=BODY_RADIUS_BASE * (1.0 - BODY_RADIUS_BASE_JITTER),
         body_radius_base_max=BODY_RADIUS_BASE * (1.0 + BODY_RADIUS_BASE_JITTER),
-        # D4 (see above): shipped as a band because the measurement is a lower
-        # bound. The point value is the conservative (net) end.
-        boost_mass_cost_per_tick=REAL_BOOST_MASS_COST_PER_S_LO / TICK_HZ,
+        # D4 (see above): shipped as a band; the deterministic point value is
+        # the mid-band 0.25 mass/s = 0.00625 mass/tick.
+        boost_mass_cost_per_tick=REAL_BOOST_MASS_COST_PER_S_MID / TICK_HZ,
         boost_mass_cost_per_tick_min=REAL_BOOST_MASS_COST_PER_S_LO / TICK_HZ,
         boost_mass_cost_per_tick_max=REAL_BOOST_MASS_COST_PER_S_HI / TICK_HZ,
     )
