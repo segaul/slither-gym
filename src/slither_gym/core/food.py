@@ -1,13 +1,33 @@
+import math
+
 import numpy as np
 from numpy.typing import NDArray
 
 from slither_gym.core.types import WorldConfig
+
+# Pellet-grid cell size (u). Only a perf knob: queries are bbox-based (any
+# radius), and every arithmetic result is independent of it. 256 keeps a
+# collect-radius query (~<100 u) at <=9 cells and a 500 u obs query at ~9-16.
+_FOOD_CELL = 256.0
 
 
 class FoodManager:
     """
     Manages food pellets in a pre-allocated array.
     Uses a free-list pattern for O(1) spawn/despawn without reallocation.
+
+    Perf (env-throughput batch, 2026-08-09): collect_near used to scan the
+    ENTIRE pool (81920 slots at the eval-matched config) per snake per tick.
+    Pellets are now also indexed in a cell grid; collect_near and
+    query_candidates gather only nearby cells and then run the ORIGINAL
+    full-scan arithmetic on that candidate subset, sorted ascending by global
+    index — the same subset in the same order the full-pool boolean masks
+    produced, so distances (float32, same elementwise ops), the pairwise
+    np.sum of collected values, and the free-list push order are all
+    bitwise-identical. Cells are derived from the STORED float32 positions
+    (not the pre-store float64 spawn coords) and the query bbox is padded by
+    one cell, so float32 rounding at a cell boundary can never hide a pellet
+    the full scan would have hit. Verified vs the SHA-256 physics goldens.
     """
 
     def __init__(self, config: WorldConfig, rng: np.random.Generator) -> None:
@@ -25,6 +45,57 @@ class FoodManager:
         # suppresses floor spawning until the corpse is eaten.
         self._floor_count: int = 0
         self._free: list[int] = list(range(config.max_food))
+        # Cell grid over ALIVE pellets: (cx, cy) -> set of pellet indices.
+        # Sets are fine (unordered): every consumer sorts candidates ascending.
+        self._grid: dict[tuple[int, int], set[int]] = {}
+        # Registered cell per alive slot, so removal never re-derives the key.
+        self._cell_of: dict[int, tuple[int, int]] = {}
+
+    def _grid_add(self, idx: int) -> None:
+        cs = _FOOD_CELL
+        key = (
+            math.floor(float(self._positions[idx, 0]) / cs),
+            math.floor(float(self._positions[idx, 1]) / cs),
+        )
+        self._grid.setdefault(key, set()).add(idx)
+        self._cell_of[idx] = key
+
+    def _grid_remove(self, idx: int) -> None:
+        key = self._cell_of.pop(idx)
+        cell = self._grid[key]
+        cell.discard(idx)
+        if not cell:
+            del self._grid[key]
+
+    def _candidates(self, x: float, y: float, radius: float) -> NDArray[np.int64]:
+        """Alive pellet indices (ascending) from all cells overlapping the
+        radius-bbox around (x, y), padded one cell against float32 boundary
+        rounding. Superset of every pellet the full scan could hit."""
+        cs = _FOOD_CELL
+        cx0 = math.floor((x - radius) / cs) - 1
+        cx1 = math.floor((x + radius) / cs) + 1
+        cy0 = math.floor((y - radius) / cs) - 1
+        cy1 = math.floor((y + radius) / cs) + 1
+        grid = self._grid
+        found: list[int] = []
+        # Huge radii (tests use 1e9) would make the bbox loop iterate millions
+        # of empty cells; when the bbox has more cells than exist, walk the
+        # occupied cells instead. Same candidate set either way.
+        if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) >= len(grid):
+            for (cx, cy), cell in grid.items():
+                if cx0 <= cx <= cx1 and cy0 <= cy <= cy1:
+                    found.extend(cell)
+        else:
+            for cx in range(cx0, cx1 + 1):
+                for cy in range(cy0, cy1 + 1):
+                    cell = grid.get((cx, cy))
+                    if cell:
+                        found.extend(cell)
+        if not found:
+            return np.zeros(0, dtype=np.int64)
+        cand = np.array(found, dtype=np.int64)
+        cand.sort()
+        return cand
 
     def spawn_batch(self, count: int) -> None:
         """Spawn count pellets at random positions within map bounds.
@@ -92,6 +163,7 @@ class FoodManager:
             if not self._is_corpse[min_idx]:
                 self._floor_count -= 1
             self._free.append(min_idx)
+            self._grid_remove(min_idx)
         idx = self._free.pop()
         self._positions[idx, 0] = x
         self._positions[idx, 1] = y
@@ -101,28 +173,50 @@ class FoodManager:
         self._count += 1
         if not corpse:
             self._floor_count += 1
+        self._grid_add(idx)
 
     def collect_near(self, x: float, y: float, radius: float) -> float:
-        """Remove all food within radius of (x, y). Returns total value collected."""
+        """Remove all food within radius of (x, y). Returns total value collected.
+
+        Bitwise contract: identical to the historical full-pool scan — the
+        candidate subset is ascending-ordered and a superset of any possible
+        hit, the distance test is the same float32 expression, and the value
+        sum runs over the same hit sequence (same pairwise summation)."""
         if self._count == 0:
             return 0.0
 
-        dx = self._positions[:, 0] - x
-        dy = self._positions[:, 1] - y
+        cand = self._candidates(x, y, radius)
+        if cand.size == 0:
+            return 0.0
+
+        pos = self._positions[cand]
+        dx = pos[:, 0] - x
+        dy = pos[:, 1] - y
         dist_sq = dx * dx + dy * dy
-        hit = self._alive & (dist_sq < radius * radius)
+        hit = self._alive[cand] & (dist_sq < radius * radius)
 
         if not np.any(hit):
             return 0.0
 
-        total = float(np.sum(self._values[hit]))
-        hit_indices = np.where(hit)[0]
+        hit_indices = cand[hit]
+        total = float(np.sum(self._values[hit_indices]))
         self._alive[hit_indices] = False
         self._count -= len(hit_indices)
         self._floor_count -= int(np.count_nonzero(~self._is_corpse[hit_indices]))
         self._free.extend(hit_indices.tolist())
+        for i in hit_indices.tolist():
+            self._grid_remove(i)
 
         return total
+
+    def query_candidates(self, x: float, y: float, radius: float) -> NDArray[np.int64]:
+        """READ-ONLY: ascending global indices of alive pellets in the padded
+        radius-bbox around (x, y) — a superset of everything within `radius`.
+        For observation builders that then reproduce the exact full-scan
+        arithmetic on the subset (see rl/env_gym bot-obs fast path)."""
+        if self._count == 0:
+            return np.zeros(0, dtype=np.int64)
+        return self._candidates(x, y, radius)
 
     def alive_count(self) -> int:
         """Number of pellets currently alive (floor food + corpse drops)."""
