@@ -46,6 +46,11 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         bot_policies: dict[int, Any] | None = None,
         obs_schema: str = "v4",
         obs_config_v5: ObsConfigV5 | None = None,
+        bot_sct_law: str | None = None,
+        bot_sct_log_median: float = 22.0,
+        bot_sct_log_sigma: float = 1.632,
+        bot_sct_min: float = 2.0,
+        bot_sct_max: float = 256.0,
     ) -> None:
         super().__init__()
         if obs_schema not in ("v4", "v5"):
@@ -68,6 +73,27 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         self._seed = seed
         self._respawn_bots = respawn_bots
         self._render_mode = render_mode
+
+        # P0.5 (frozen_eval_v8): opponent SIZE distribution. Real slither.io
+        # opponents span sct 2-262 (measured p10 2, p50 22, p90 178 — 8-game
+        # consolidated set, docs/SIM_REALISM_STATE.md), while the legacy sim
+        # spawns every bot at initial_mass. When bot_sct_law == "lognormal",
+        # each BOT (never the RL agent, snake 0) spawns AND respawns with
+        #   sct ~ clip(lognormal(median=bot_sct_log_median,
+        #                        sigma=bot_sct_log_sigma),
+        #              bot_sct_min, bot_sct_max)
+        # converted to mass via mass = initial_mass + (sct - initial_segments)
+        # (the inverse of snake.py's sct formula). None (default) draws NO RNG
+        # and spawns at initial_mass — byte-identical to every pre-P0.5 run.
+        if bot_sct_law not in (None, "lognormal"):
+            raise ValueError(
+                f"bot_sct_law must be None or 'lognormal', got {bot_sct_law!r}"
+            )
+        self._bot_sct_law = bot_sct_law
+        self._bot_sct_log_median = float(bot_sct_log_median)
+        self._bot_sct_log_sigma = float(bot_sct_log_sigma)
+        self._bot_sct_min = float(bot_sct_min)
+        self._bot_sct_max = float(bot_sct_max)
 
         self._world: World | None = None
         self._rng = np.random.default_rng(seed)
@@ -147,7 +173,7 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         self._snake_cache.reset()
 
         for i in range(1 + self._num_bots):
-            self._world.spawn_snake(i)
+            self._world.spawn_snake(i, mass=self._bot_spawn_mass() if i > 0 else None)
 
         # S4: re-sample the per-episode delay (resolved config) and seed the
         # FIFO with the RL snake's spawn heading / no boost, so the first
@@ -305,7 +331,9 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             for i in range(1, 1 + self._num_bots):
                 state = self._world.get_snake_states().get(i)
                 if state is None or not state.alive:
-                    self._world.spawn_snake(i)
+                    # P0.5: respawns re-draw from the same size law, keeping the
+                    # opponent size DISTRIBUTION stationary over the episode.
+                    self._world.spawn_snake(i, mass=self._bot_spawn_mass())
                     # Reset stateful policies on respawn
                     if i in self._bot_policies and hasattr(self._bot_policies[i], 'reset'):
                         self._bot_policies[i].reset(i)
@@ -363,6 +391,28 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             self._world_config.perception_radius,
         )
         return compute_observation(raw, self._obs_config, snake_slot_mapping=slot_mapping)
+
+    def _bot_spawn_mass(self) -> float | None:
+        """Sample a bot's spawn mass from the configured size law.
+
+        Returns None (spawn at initial_mass, zero RNG draws — legacy
+        byte-identity) unless bot_sct_law is set. "lognormal": sct is drawn
+        from lognormal(ln(median), sigma) and clipped to
+        [bot_sct_min, bot_sct_max]; the sim's segment cap
+        (max_segments_per_snake, 256) is the natural ceiling. Draws exactly
+        one value from self._rng per call, so pinned seeds stay deterministic.
+        """
+        if self._bot_sct_law is None:
+            return None
+        sct = float(
+            self._rng.lognormal(
+                mean=math.log(self._bot_sct_log_median), sigma=self._bot_sct_log_sigma
+            )
+        )
+        sct = min(max(sct, self._bot_sct_min), self._bot_sct_max)
+        cfg = self._world_config
+        # Inverse of snake.py: sct = initial_segments + (mass - initial_mass).
+        return cfg.initial_mass + (sct - cfg.initial_segments)
 
     def _update_bot_obs_cache(self) -> None:
         assert self._world is not None
