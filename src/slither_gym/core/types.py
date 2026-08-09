@@ -182,6 +182,20 @@ class WorldConfig:
     corpse_mass_multiplier: float = 20.0
     corpse_pellet_value_target: float = 12.1
 
+    # --- S4: action latency (V5 plan, E5) ---
+    # The real control loop is a ~30 Hz client plus network RTT; the sim
+    # applies an RL action to the very next physics tick with zero latency.
+    # action_delay_ticks delays the EXTERNALLY-COMMANDED (RL) action path by
+    # this many physics ticks: the action applied at tick t is the one
+    # commanded at tick t - delay, through a per-snake FIFO seeded with the
+    # spawn heading / no-boost. Enforced at the ENV layer (env_gym /
+    # env_parallel), not in World -- World cannot tell RL snakes from bots,
+    # and bots model other players whose latency is already implicit in
+    # their behavior, so they are never delayed.
+    # 0 = legacy zero-latency, byte-identical to every pre-S4 run.
+    # Scale: 0-2 client frames at 30 Hz ~= 0-66 ms ~= 0-3 sim ticks at 40 Hz.
+    action_delay_ticks: int = 0
+
     # --- Domain randomization over UNMEASURED / UNCONFIRMED physics ---
     # Master gate. False => sample_world_config() is a no-op and draws no RNG,
     # so eval and every existing run stay bit-identical. Presets ship honest
@@ -224,6 +238,12 @@ class WorldConfig:
     # counted directly. Preset band 0.10..0.20 (mixture mean ~5.9..~6.6).
     food_tail_weight_min: float | None = None
     food_tail_weight_max: float | None = None
+    # action_delay_ticks: real RTT is UNMEASURED until the first live bridge
+    # session (V5 plan S4/S7); the band covers 0-2 client frames at 30 Hz.
+    # INTEGER range, sampled INCLUSIVE on both ends -- (0, 3) draws from
+    # {0, 1, 2, 3} sim ticks, per-episode, constant within an episode.
+    action_delay_ticks_min: int | None = None
+    action_delay_ticks_max: int | None = None
 
 
 @dataclass

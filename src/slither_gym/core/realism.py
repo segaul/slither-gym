@@ -202,6 +202,19 @@ REAL_BOOST_MASS_COST_PER_S_LO = 0.1
 REAL_BOOST_MASS_COST_PER_S_MID = 0.25
 REAL_BOOST_MASS_COST_PER_S_HI = 0.5
 
+# --- S4: action latency (V5 plan, E5) ---------------------------------------
+# The real control loop is a ~30 Hz client (measured frame interval ~0.0331 s)
+# plus network RTT; the sim's legacy behavior applies an action to the very
+# next 40 Hz physics tick with zero latency. RTT is UNMEASURED until the first
+# live bridge session (S7), so the band is the plan's stated envelope:
+# 0-2 client frames = 0-66 ms = 0-3 sim ticks at 40 Hz, sampled per-episode.
+# The deterministic point value is 1 tick (~1 client frame of pipeline delay,
+# the minimum a real client ever has), so a non-randomized realistic run is
+# not pinned to the physically-impossible zero-latency edge.
+ACTION_DELAY_TICKS = 1
+ACTION_DELAY_TICKS_LO = 0   # inclusive
+ACTION_DELAY_TICKS_HI = 3   # inclusive
+
 # --- B1: R0, the one dimensional body-width quantity -----------------------
 # *** NOT MEASURED. *** The capture set gives the width RATIO (1.0 -> 3.45) and
 # never an absolute half-width in world units. R0 is pinned instead by holding a
@@ -293,6 +306,9 @@ def realistic_world_config(
         # collect radius of 8.27 u is smaller than one boosting step). ---
         collect_radius_base=REAL_COLLECT_RADIUS,
         collect_radius_mass_mult=0.0,
+        # --- S4: 1 tick of action latency (~1 client frame), the minimum a
+        # real 30 Hz client ever has; the DR band below covers RTT ---
+        action_delay_ticks=ACTION_DELAY_TICKS,
         randomize_physics=randomize_physics,
         # Uncertainty ranges. Inert unless randomize_physics is True.
         boost_turn_multiplier_min=BOOST_TURN_MULTIPLIER_LO,
@@ -310,6 +326,10 @@ def realistic_world_config(
         boost_mass_cost_per_tick=REAL_BOOST_MASS_COST_PER_S_MID / TICK_HZ,
         boost_mass_cost_per_tick_min=REAL_BOOST_MASS_COST_PER_S_LO / TICK_HZ,
         boost_mass_cost_per_tick_max=REAL_BOOST_MASS_COST_PER_S_HI / TICK_HZ,
+        # S4: RTT unmeasured until the first live bridge session -- the band
+        # is the plan's 0-2 client-frame envelope (0-3 ticks, inclusive).
+        action_delay_ticks_min=ACTION_DELAY_TICKS_LO,
+        action_delay_ticks_max=ACTION_DELAY_TICKS_HI,
     )
     if real_world_scale:
         # Now a MEASURED constant (border hit at r = 14976.5), so it is a point
@@ -338,6 +358,14 @@ _RANDOMIZED_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("food_tail_weight", "food_tail_weight_min", "food_tail_weight_max"),
 )
 
+# Integer-valued randomized fields: sampled with rng.integers, INCLUSIVE on
+# both ends (a (0, 3) band draws uniformly from {0, 1, 2, 3}), unlike the
+# float fields above which use rng.uniform over the open-ended interval.
+_RANDOMIZED_INT_FIELDS: tuple[tuple[str, str, str], ...] = (
+    # S4: action latency in sim ticks. RTT unmeasured; band = 0-2 client frames.
+    ("action_delay_ticks", "action_delay_ticks_min", "action_delay_ticks_max"),
+)
+
 
 def sample_world_config(config: WorldConfig, rng: np.random.Generator) -> WorldConfig:
     """Resolve every randomized physics range to a concrete scalar.
@@ -360,6 +388,13 @@ def sample_world_config(config: WorldConfig, rng: np.random.Generator) -> WorldC
         if lo is None or hi is None or hi <= lo:
             continue
         overrides[field] = float(rng.uniform(lo, hi))
+    for field, lo_name, hi_name in _RANDOMIZED_INT_FIELDS:
+        lo = getattr(config, lo_name)
+        hi = getattr(config, hi_name)
+        if lo is None or hi is None or hi <= lo:
+            continue
+        # Inclusive on both ends: (0, 3) covers {0, 1, 2, 3}.
+        overrides[field] = int(rng.integers(int(lo), int(hi) + 1))
     if not overrides:
         return config
     return dataclasses.replace(config, **overrides)

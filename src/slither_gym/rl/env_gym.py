@@ -10,6 +10,7 @@ from numpy.typing import NDArray
 from slither_gym.core.realism import sample_world_config
 from slither_gym.core.types import WorldConfig
 from slither_gym.core.world import World
+from slither_gym.rl.action_delay import ActionDelayQueue
 from slither_gym.rl.bot_policy import BotPolicy
 from slither_gym.rl.env_parallel import SlitherParallelEnv
 from slither_gym.rl.obs_processor import compute_observation
@@ -80,6 +81,11 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         # danger width than the agent (built lazily in _obs_config_for_bot).
         self._per_kdanger_obs_config: dict[int, ObsConfig] = {}
         self._prev_phi: float = 0.0  # E13: cut-readiness potential Φ(s) from the previous RL step
+        # S4: latency FIFO for the RL action path only (bots are never delayed
+        # — they model other players whose latency is implicit in their
+        # behavior). Rebuilt each reset from the RESOLVED per-episode config,
+        # so a randomized delay is constant within an episode.
+        self._action_delay = ActionDelayQueue(world_config.action_delay_ticks)
 
     def set_bot_difficulty(self, difficulty: float | None) -> None:
         """E11 curriculum hook: override bot difficulty for subsequent episodes.
@@ -122,6 +128,12 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
 
         for i in range(1 + self._num_bots):
             self._world.spawn_snake(i)
+
+        # S4: re-sample the per-episode delay (resolved config) and seed the
+        # FIFO with the RL snake's spawn heading / no boost, so the first
+        # `delay` ticks match an uncommanded snake exactly.
+        self._action_delay = ActionDelayQueue(self._world_config.action_delay_ticks)
+        self._action_delay.seed(self._world.get_snake_states()[0].angle)
 
         rl_obs = self._get_rl_observation()
         self._update_bot_obs_cache()
@@ -228,7 +240,12 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         last_step_result = None
 
         for _ in range(config.step_mul):
-            world_actions: dict[int, tuple[float, float, bool]] = {0: (cos_a, sin_a, boost)}
+            # S4: per-tick FIFO — the action applied at tick t is the one
+            # commanded at t - delay. No-op (returns the tuple unchanged)
+            # when action_delay_ticks == 0, the legacy default.
+            world_actions: dict[int, tuple[float, float, bool]] = {
+                0: self._action_delay.apply((cos_a, sin_a, boost))
+            }
             world_actions.update(bot_actions)
 
             results = self._world.step(world_actions)

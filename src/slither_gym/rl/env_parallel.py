@@ -12,6 +12,7 @@ from pettingzoo import ParallelEnv
 from slither_gym.core.realism import sample_world_config
 from slither_gym.core.types import WorldConfig
 from slither_gym.core.world import World
+from slither_gym.rl.action_delay import ActionDelayQueue
 from slither_gym.rl.obs_processor import compute_observation
 from slither_gym.rl.reward import compute_reward
 from slither_gym.rl.types import AgentId, EnemySnakeInfo, ObsConfig, RawGameState
@@ -46,6 +47,9 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
 
         self._world: World | None = None
         self._tick_count: int = 0
+        # S4: per-agent latency FIFOs. EVERY agent here is externally
+        # commanded (this env has no scripted bots), so all are delayed.
+        self._action_delays: dict[int, ActionDelayQueue] = {}
 
         self.possible_agents: list[AgentId] = [
             f"snake_{i}" for i in range(num_agents)
@@ -75,6 +79,16 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
 
         for i in range(self._num_agents):
             self._world.spawn_snake(i)
+
+        # S4: per-episode delay (constant within the episode, re-sampled by
+        # sample_world_config above when DR is on); each queue seeds with its
+        # snake's spawn heading / no boost.
+        states = self._world.get_snake_states()
+        self._action_delays = {}
+        for i in range(self._num_agents):
+            q = ActionDelayQueue(self._world_config.action_delay_ticks)
+            q.seed(states[i].angle)
+            self._action_delays[i] = q
 
         observations = self._get_observations()
         infos: dict[AgentId, dict[str, Any]] = {agent: {} for agent in self.agents}
@@ -112,7 +126,13 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
         current_agents = list(self.agents)
 
         for _ in range(self._world_config.step_mul):
-            results = self._world.step(world_actions)
+            # S4: per-tick FIFO per agent — apply the action commanded
+            # `delay` ticks ago. No-op when action_delay_ticks == 0.
+            applied = {
+                sid: self._action_delays[sid].apply(act)
+                for sid, act in world_actions.items()
+            }
+            results = self._world.step(applied)
             self._tick_count += 1
 
             for agent_id in current_agents:
