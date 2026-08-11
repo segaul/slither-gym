@@ -7,6 +7,7 @@ import gymnasium
 import numpy as np
 from numpy.typing import NDArray
 
+from slither_gym.core.growth import real_mass_continuous
 from slither_gym.core.realism import sample_world_config
 from slither_gym.core.types import WorldConfig
 from slither_gym.core.world import World
@@ -415,6 +416,10 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         )
         sct = min(max(sct, self._bot_sct_min), self._bot_sct_max)
         cfg = self._world_config
+        if cfg.growth_law == "real":
+            # R3: the mass currency is the client's own (fpsls/fmlts law), so
+            # the sct->mass inverse is real_mass at the drawn continuous size.
+            return real_mass_continuous(sct)
         # Inverse of snake.py: sct = initial_segments + (mass - initial_mass).
         return cfg.initial_mass + (sct - cfg.initial_segments)
 

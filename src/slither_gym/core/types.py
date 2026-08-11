@@ -182,6 +182,34 @@ class WorldConfig:
     corpse_mass_multiplier: float = 20.0
     corpse_pellet_value_target: float = 12.1
 
+    # --- R3: growth law (pellet value -> mass -> segments) ---
+    # "legacy": pellet value adds to mass 1:1 and
+    #   sct = initial_segments + int(mass - initial_mass), i.e. one mass unit
+    #   per segment. A mean measured pellet (value 6.25) therefore grants 6.25
+    #   SEGMENTS and the sct-256 physics cap is saturated ~23 s into a 200 s
+    #   episode — after which width/turn/segments are all capped (mass is
+    #   physically inert) while reward keeps paying mass_delta, a diagnosed
+    #   degenerate optimum (E32). Byte-identical default.
+    # "real": mass is tracked in the CLIENT'S OWN currency (the fpsls/fmlts
+    #   LUT quantity, docs/REAL_GAME_DATA.md "length"; core/growth.py), and
+    #   (sct, fam) derive from mass through the exact LUT inverse. The law is
+    #   superlinear — a segment costs >= 16.5 mass at the relevant sizes while
+    #   a mean pellet is worth ~1.3 mass — so segment growth runs ~79x slower
+    #   than legacy at measured pellet values and the sct-256 cap is reached
+    #   on the real timescale (~80 min of pure foraging at measured density,
+    #   not 23 s). Reward stays mass_delta on this real, continuous scale.
+    #   Derivation: docs/experiments/data/growth_law_r3.py (slither-rl).
+    growth_law: str = "legacy"
+    # Mass gained per unit of pellet VALUE, read only under growth_law="real"
+    # (legacy is hard-wired 1:1). = measured growth per pellet (~1.3 mass
+    # units, docs/REAL_GAME_DATA.md sec. 4) / measured mean pellet value
+    # (6.25, the C3 mixture mean) = 0.208. A RATIO OF TWO MEASUREMENTS, not a
+    # client constant — genuinely uncertain, so it carries a DR band below.
+    # The LUT law itself is exact (bitwise-verified) and is NOT randomized.
+    pellet_mass_per_value: float = 0.208
+    pellet_mass_per_value_min: float | None = None
+    pellet_mass_per_value_max: float | None = None
+
     # --- S4: action latency (V5 plan, E5) ---
     # The real control loop is a ~30 Hz client plus network RTT; the sim
     # applies an RL action to the very next physics tick with zero latency.

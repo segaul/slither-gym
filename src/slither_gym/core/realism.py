@@ -148,6 +148,38 @@ CORPSE_MASS_MULTIPLIER_HI = 30.0    # +50%
 # corpse pellet's value lands inside the measured tail.
 CORPSE_PELLET_VALUE_TARGET = 12.1
 
+# --- R3: growth law ----------------------------------------------------------
+# The client converts eaten pellet value into segments through the superlinear
+# fpsls/fmlts LUT law (core/growth.py; bitwise-verified vs the game01 capture,
+# mscps=430). The legacy sim's 1-mass-per-segment conversion grew segments
+# ~79x too fast at measured pellet values and hit the sct-256 physics cap
+# ~23 s into a 200 s episode (docs/experiments/data/growth_law_r3.py) —
+# the diagnosed E32 degenerate optimum. growth_law="real" tracks mass in the
+# client's own currency; the two constants below are the only free numbers.
+#
+# Mass per unit of pellet value = measured growth per pellet (~1.3 mass/length
+# units, docs/REAL_GAME_DATA.md sec. 4, 3-game growth-attribution pass)
+# / measured mean pellet value (6.25, the C3 mixture mean) = 0.208.
+# A RATIO OF TWO MEASUREMENTS (the 1.3 figure carries first-pass error), so it
+# gets a +/-30% DR band; the LUT law itself is exact and is NOT randomized.
+REAL_LENGTH_PER_PELLET = 1.3
+PELLET_MASS_PER_VALUE = REAL_LENGTH_PER_PELLET / 6.25  # 0.208
+PELLET_MASS_PER_VALUE_JITTER = 0.3
+# D1 corpse multiplier RE-DERIVED for the real currency. The legacy-currency
+# 20.0 ("~400 pellets vs the victim's ~20 mass") assumed pellet value == mass
+# 1:1; in the client currency the anchor measurement is M3 (2026-W32): one
+# gorge banked +520 mass from a sct-77 + sct-11 victim pair, whose real masses
+# are real_mass(77,0) + real_mass(11,0) = 1419.2 + 149.4 = 1568.6. With
+# banked = pellet_mass_per_value * multiplier * victim_mass, the multiplier is
+#   520 / (0.208 * 1568.6) = 1.594
+# (i.e. a fully-eaten corpse returns ~33% of the victim's real mass in the
+# scavenger's currency — vs legacy-real's 20x * 0.208 = 4.16x, which would
+# have made every kill worth 4 victims). Same honest +/-50% band as D1: the
+# 520 figure is growth attribution, not a logged kill event.
+CORPSE_MASS_MULTIPLIER_REAL = 1.594
+CORPSE_MASS_MULTIPLIER_REAL_LO = 0.797   # -50%
+CORPSE_MASS_MULTIPLIER_REAL_HI = 2.391   # +50%
+
 # --- Fitted A3 curve -------------------------------------------------------
 # w(sct) = w_max - (w_max - w_min) * u^q,  u = clip((sct-10)/(256-10), 0, 1).
 # Least squares over REAL_TURN_RATE_BINS (grid search q in [0.30, 3.00] step
@@ -230,6 +262,12 @@ ACTION_DELAY_TICKS_HI = 3   # inclusive
 # would be 0.16344 * 20.0 / 1.075472 = 3.04. Do not mix.
 BODY_RADIUS_BASE = 6.5
 BODY_RADIUS_BASE_JITTER = 0.3  # +/-30%, for any run whose conclusion needs R0
+# R3 interaction: real-growth spawns are sct 2 (sc exactly 1.0), so the spawn
+# half-width equals R0 itself. World.__init__'s anti-tunneling invariant
+# (boost_speed <= 2 * min body radius) therefore clips the DR band's low edge
+# at boost_speed/2 = 9.325/2 = 4.66 u; 4.68 leaves a hair of margin. Under the
+# old sct-10 spawn (sc 1.0755) the -30% edge (4.55) never bound.
+BODY_RADIUS_BASE_MIN_FLOOR = 4.68
 
 
 def realistic_world_config(
@@ -293,10 +331,18 @@ def realistic_world_config(
         food_tail_lo=FOOD_TAIL_LO,
         food_tail_hi=FOOD_TAIL_HI,
         food_tail_weight=FOOD_TAIL_WEIGHT,
-        # --- D1/P0.3: corpse worth ~20x the victim's mass (real ~400 pellets
-        # vs the legacy sim's ~20), pellets valued inside the 10-14.2 tail ---
+        # --- R3: the client growth law. Mass is the client's own fpsls/fmlts
+        # currency; pellet value converts at the measured 0.208 mass/value
+        # (mean pellet ~1.3 mass, one segment >= 16.5 mass -> the real ~79x
+        # slower segment growth and a ~minutes, not ~23 s, sct-256 cap) ---
+        growth_law="real",
+        pellet_mass_per_value=PELLET_MASS_PER_VALUE,
+        # --- D1/P0.3: corpse value, in the REAL currency (see the R3 block:
+        # multiplier 1.594 reproduces the measured +520-mass gorge from the
+        # sct-77+11 pair; the legacy-currency 20.0 would overpay ~12x here).
+        # Pellet VALUES still land inside the observed 10-14.2 tail ---
         corpse_value_law="real",
-        corpse_mass_multiplier=CORPSE_MASS_MULTIPLIER,
+        corpse_mass_multiplier=CORPSE_MASS_MULTIPLIER_REAL,
         corpse_pellet_value_target=CORPSE_PELLET_VALUE_TARGET,
         # --- C5: ~75 u measured (distance to nearest food when an eat fires).
         # mass_mult is 0.0 because the measurement resolves a single radius and
@@ -313,11 +359,18 @@ def realistic_world_config(
         # Uncertainty ranges. Inert unless randomize_physics is True.
         boost_turn_multiplier_min=BOOST_TURN_MULTIPLIER_LO,
         boost_turn_multiplier_max=BOOST_TURN_MULTIPLIER_HI,
-        body_radius_base_min=BODY_RADIUS_BASE * (1.0 - BODY_RADIUS_BASE_JITTER),
+        body_radius_base_min=max(
+            BODY_RADIUS_BASE * (1.0 - BODY_RADIUS_BASE_JITTER),
+            BODY_RADIUS_BASE_MIN_FLOOR,  # R3: sct-2 spawns bind the
+        ),                               # anti-tunneling invariant (see note)
         body_radius_base_max=BODY_RADIUS_BASE * (1.0 + BODY_RADIUS_BASE_JITTER),
-        # P0.3: corpse multiplier is inferred, not counted -- +/-50% band.
-        corpse_mass_multiplier_min=CORPSE_MASS_MULTIPLIER_LO,
-        corpse_mass_multiplier_max=CORPSE_MASS_MULTIPLIER_HI,
+        # P0.3/R3: corpse multiplier is inferred, not counted -- +/-50% band
+        # around the real-currency point value (see the R3 block).
+        corpse_mass_multiplier_min=CORPSE_MASS_MULTIPLIER_REAL_LO,
+        corpse_mass_multiplier_max=CORPSE_MASS_MULTIPLIER_REAL_HI,
+        # R3: mass-per-pellet-value is a ratio of two measurements -- +/-30%.
+        pellet_mass_per_value_min=PELLET_MASS_PER_VALUE * (1.0 - PELLET_MASS_PER_VALUE_JITTER),
+        pellet_mass_per_value_max=PELLET_MASS_PER_VALUE * (1.0 + PELLET_MASS_PER_VALUE_JITTER),
         # P0.3: tail weight is solved from the mean constraint, not counted.
         food_tail_weight_min=FOOD_TAIL_WEIGHT_LO,
         food_tail_weight_max=FOOD_TAIL_WEIGHT_HI,
@@ -356,6 +409,10 @@ _RANDOMIZED_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("corpse_mass_multiplier", "corpse_mass_multiplier_min", "corpse_mass_multiplier_max"),
     # P0.3: the food-value tail weight is solved from the mean constraint.
     ("food_tail_weight", "food_tail_weight_min", "food_tail_weight_max"),
+    # R3: mass gained per unit pellet value is the ratio of two measurements
+    # (1.3 length/pellet over mean value 6.25), not a client constant. The
+    # fpsls/fmlts LUT law itself is exact and is deliberately NOT randomized.
+    ("pellet_mass_per_value", "pellet_mass_per_value_min", "pellet_mass_per_value_max"),
 )
 
 # Integer-valued randomized fields: sampled with rng.integers, INCLUSIVE on

@@ -11,6 +11,7 @@ import math
 import numpy as np
 import pytest
 
+from slither_gym.core.growth import real_mass, real_mass_continuous
 from slither_gym.core.realism import (
     REAL_TURN_RATE_BINS,
     TICK_HZ,
@@ -84,19 +85,23 @@ def test_a1_a2_speeds_match_measured_units_per_second() -> None:
 
 @pytest.mark.parametrize("sct,expected_rad_per_s", REAL_TURN_RATE_BINS)
 def test_a3_turn_curve_matches_measured_p95_bins(sct: float, expected_rad_per_s: float) -> None:
+    # R3: the preset's mass currency is the client's own, so sct -> mass goes
+    # through the LUT law rather than the legacy 1-mass-per-segment identity.
     c = realistic_world_config()
-    mass = c.initial_mass + (sct - c.initial_segments)
+    mass = real_mass_continuous(sct)
     assert compute_turn_rate(mass, c) * TICK_HZ == pytest.approx(expected_rad_per_s, abs=0.08)
 
 
 def test_a3_endpoint_span_matches_the_real_1_9x_range() -> None:
     c = realistic_world_config()
-    span = compute_turn_rate(10.0, c) / compute_turn_rate(256.0, c)
+    span = compute_turn_rate(real_mass_continuous(10.0), c) / compute_turn_rate(
+        real_mass_continuous(256.0), c
+    )
     assert span == pytest.approx(2.13, abs=0.02)
     # Over the six measured bin representatives the realized span is the ~1.9x
     # the measurement reports (the endpoint span is wider because sct=256 is an
     # extrapolation past the last bin).
-    rates = [compute_turn_rate(c.initial_mass + (s - 10), c) for s, _ in REAL_TURN_RATE_BINS]
+    rates = [compute_turn_rate(real_mass_continuous(s), c) for s, _ in REAL_TURN_RATE_BINS]
     assert max(rates) / min(rates) == pytest.approx(1.94, abs=0.05)
 
 
@@ -180,16 +185,19 @@ def test_state_turn_rate_stays_the_unboosted_base_rate() -> None:
 
 @pytest.mark.parametrize("sct", [2, 10, 22, 100, 178, 256])
 def test_b1_width_follows_the_measured_sc_law_exactly(sct: int) -> None:
+    # R3: sct -> mass via the client LUT law (the preset's currency). The old
+    # sct-10 floor is gone with it: real-growth snakes reach the client's own
+    # minimum sct 2, where sc == 1 exactly.
     c = realistic_world_config()
-    mass = c.initial_mass + (sct - c.initial_segments)
-    sc = 1.0 + (max(sct, c.initial_segments) - 2.0) / 106.0  # sim floors at sct=10
+    mass = real_mass(sct, 0.0)
+    sc = 1.0 + (sct - 2.0) / 106.0
     assert compute_segment_radius(mass, c) == pytest.approx(c.body_radius_base * sc)
 
 
 def test_b1_span_approaches_the_measured_3_45x() -> None:
     c = realistic_world_config()
-    lo = compute_segment_radius(c.initial_mass, c)                      # sct 10
-    hi = compute_segment_radius(c.initial_mass + 246, c)                # sct 256
+    lo = compute_segment_radius(real_mass(10, 0.0), c)                  # sct 10
+    hi = compute_segment_radius(real_mass(256, 0.0), c)                 # sct 256
     assert hi / lo == pytest.approx(3.16, abs=0.02)
     # ...versus the legacy law's reachable span, which is nearly flat. This is
     # the real defect B1 fixes: the sim was too FLAT, not too fat.
@@ -446,13 +454,20 @@ def test_randomization_covers_the_documented_uncertainty() -> None:
     # D4 boost mass cost is BOUNDED, not point-measured: a band, never a point.
     assert min(d.boost_mass_cost_per_tick for d in draws) >= 0.1 / 40
     assert max(d.boost_mass_cost_per_tick for d in draws) <= 0.5 / 40
-    # R0 is not measured at all.
-    assert min(d.body_radius_base for d in draws) >= 6.5 * 0.7
+    # R0 is not measured at all. Low edge clipped at 4.68 (R3: sct-2 spawns
+    # bind the anti-tunneling invariant; see BODY_RADIUS_BASE_MIN_FLOOR).
+    assert min(d.body_radius_base for d in draws) >= 4.68
     assert max(d.body_radius_base for d in draws) <= 6.5 * 1.3
-    # P0.3: corpse multiplier is inferred (not counted) -- generous +/-50% band.
-    assert min(d.corpse_mass_multiplier for d in draws) >= 10.0
-    assert max(d.corpse_mass_multiplier for d in draws) <= 30.0
+    # P0.3/R3: corpse multiplier is inferred (not counted) -- +/-50% band
+    # around the real-currency 1.594 (the M3 gorge anchor).
+    assert min(d.corpse_mass_multiplier for d in draws) >= 0.797
+    assert max(d.corpse_mass_multiplier for d in draws) <= 2.391
     assert len({d.corpse_mass_multiplier for d in draws}) > 100  # actually sampled
+    # R3: mass-per-pellet-value is a ratio of two measurements -- +/-30% band;
+    # the LUT law itself is exact and must NOT be randomized (no field for it).
+    assert min(d.pellet_mass_per_value for d in draws) >= 0.208 * 0.7
+    assert max(d.pellet_mass_per_value for d in draws) <= 0.208 * 1.3
+    assert len({d.pellet_mass_per_value for d in draws}) > 100
     # P0.3: food tail weight is solved from the mean constraint, so it is banded.
     assert min(d.food_tail_weight for d in draws) >= 0.10
     assert max(d.food_tail_weight for d in draws) <= 0.20

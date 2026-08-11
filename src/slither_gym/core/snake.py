@@ -3,12 +3,32 @@ import math
 import numpy as np
 from numpy.typing import NDArray
 
+from slither_gym.core.growth import sct_fam_from_mass
 from slither_gym.core.types import SnakeState, WorldConfig
 
 
 def _expected_segments(mass: float, config: WorldConfig) -> int:
-    """How many segments a snake should have at a given mass."""
-    return max(config.initial_segments, config.initial_segments + int(mass - config.initial_mass))
+    """How many segments a snake should have at a given mass.
+
+    See WorldConfig.growth_law. "legacy" is one segment per mass unit
+    (byte-identical pre-R3 behavior); "real" derives sct from the client's
+    superlinear fpsls/fmlts law (core/growth.py), which is what slows segment
+    growth to the real game's timescale.
+    """
+    if config.growth_law == "legacy":
+        return max(config.initial_segments, config.initial_segments + int(mass - config.initial_mass))
+    if config.growth_law == "real":
+        return sct_fam_from_mass(mass)[0]
+    raise ValueError(f"unknown growth_law: {config.growth_law!r}")
+
+
+def initial_segment_count(config: WorldConfig) -> int:
+    """Segment count at spawn. Legacy: the configured initial_segments.
+    "real": the law-derived sct of initial_mass (= 2 at the default
+    initial_mass 10.0 — real snakes spawn at sct 2)."""
+    if config.growth_law == "real":
+        return _expected_segments(config.initial_mass, config)
+    return config.initial_segments
 
 
 def compute_segment_radius(mass: float, config: WorldConfig) -> float:
@@ -45,10 +65,17 @@ def compute_turn_rate(mass: float, config: WorldConfig) -> float:
         t = min(mass / config.max_mass, 1.0)
         return config.max_turn_rate - (config.max_turn_rate - config.min_turn_rate) * math.sqrt(t)
     if config.turn_rate_law == "real_sct":
-        # Continuous in mass on purpose: _expected_segments' int() truncation
-        # would put a 1-segment-wide staircase in the angular rate. Agrees with
-        # _expected_segments exactly at integer mass.
-        sct = config.initial_segments + (mass - config.initial_mass)
+        # Continuous in mass on purpose: _expected_segments' truncation would
+        # put a 1-segment-wide staircase in the angular rate.
+        if config.growth_law == "real":
+            # R3: continuous size = sct + fam from the client LUT inverse, so
+            # the turn law reads the LAW-DERIVED sct and reaches its sct-256
+            # endpoint on the real growth timescale.
+            s, fam = sct_fam_from_mass(mass)
+            sct = s + fam
+        else:
+            # Legacy currency: agrees with _expected_segments at integer mass.
+            sct = config.initial_segments + (mass - config.initial_mass)
         span = config.turn_sct_ref_hi - config.turn_sct_ref_lo
         u = (sct - config.turn_sct_ref_lo) / span
         u = min(max(u, 0.0), 1.0)
@@ -80,7 +107,7 @@ class SnakeManager:
     ) -> SnakeState:
         config = self._config
         start = snake_id * self._max_seg
-        seg_count = config.initial_segments
+        seg_count = initial_segment_count(config)
 
         dx = -math.cos(angle) * config.segment_spacing
         dy = -math.sin(angle) * config.segment_spacing

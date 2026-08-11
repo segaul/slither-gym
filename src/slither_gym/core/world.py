@@ -217,11 +217,21 @@ class World:
             )
             collected = self._food.collect_near(state.head_x, state.head_y, collect_radius)
             if collected > 0:
-                self._snakes.grow(sid, collected, self._segments)
+                # R3: pellet VALUE -> MASS conversion. Legacy is 1:1 (byte-
+                # identical); under growth_law="real" a unit of value is worth
+                # pellet_mass_per_value (~0.208) mass in the client's own
+                # currency, so a mean pellet (6.25) grants ~1.3 mass — and the
+                # superlinear LUT law in _expected_segments turns that into
+                # the real ~79x-slower segment growth.
+                if config.growth_law == "real":
+                    gained = collected * config.pellet_mass_per_value
+                else:
+                    gained = collected
+                self._snakes.grow(sid, gained, self._segments)
                 start, end_new = self._snakes.get_segment_slice(sid)
                 self._seg_alive[start:end_new] = True
                 self._seg_owner[start:end_new] = sid
-                remains_eaten[sid] = collected
+                remains_eaten[sid] = gained
 
         # 6. Batch-spawn food
         self._tick += 1

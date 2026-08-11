@@ -26,56 +26,16 @@ from numpy.typing import NDArray
 # Client mass LUTs (fpsls / fmlts)
 # ---------------------------------------------------------------------------
 
-# The real client ships two lookup tables in its config (probe report.config):
-#   fmlts[b] = (1 - b/mscps)^2.25          for b < mscps, then held constant
-#   fpsls[0] = 0
-#   fpsls[b] = fpsls[b-1] + 1/fmlts[b-1]   for b <= mscps, then held constant
-# Verified BITWISE (max rel err 0.0 over all 2x2479 entries) against the
-# 2026-08-09T03-22-10 game01 capture's report.config with mscps=430. This
-# recurrence is therefore the single shared source of the LUTs for sim and
-# bridge; the bridge may cross-check against the live client's tables.
-CLIENT_MSCPS = 430  # probe report.config.mscps
-CLIENT_LUT_LEN = 2479  # len(report.config.fmlts) == len(report.config.fpsls)
-
-
-def build_mass_luts(
-    mscps: int = CLIENT_MSCPS, n: int = CLIENT_LUT_LEN
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Reproduce the client's (fpsls, fmlts) tables from its recurrence."""
-    fmlts = np.empty(n, dtype=np.float64)
-    fpsls = np.empty(n, dtype=np.float64)
-    for b in range(n):
-        fmlts[b] = (1.0 - b / mscps) ** 2.25 if b < mscps else fmlts[b - 1]
-        if b == 0:
-            fpsls[b] = 0.0
-        elif b <= mscps:
-            fpsls[b] = fpsls[b - 1] + 1.0 / fmlts[b - 1]
-        else:
-            fpsls[b] = fpsls[b - 1]
-    return fpsls, fmlts
-
-
-_DEFAULT_FPSLS, _DEFAULT_FMLTS = build_mass_luts()
-
-
-def real_mass(
-    sct: int,
-    fam: float,
-    fpsls: NDArray[np.float64] | None = None,
-    fmlts: NDArray[np.float64] | None = None,
-) -> float:
-    """Real-client mass: (fpsls[sct] + fam/fmlts[sct] - 1) * 15 - 5.
-
-    Hand-checked against the W32 fam-wrap entry (docs/captains-log/2026-W32.md):
-    sct 4 -> 5 with fam 0.9619 -> 0.1171 is a continuous +0.155 gain in
-    sct+fam units, and this formula maps it to a continuous mass rise.
-    """
-    if fpsls is None:
-        fpsls = _DEFAULT_FPSLS
-    if fmlts is None:
-        fmlts = _DEFAULT_FMLTS
-    i = min(max(int(sct), 0), len(fpsls) - 1)
-    return (float(fpsls[i]) + fam / float(fmlts[i]) - 1.0) * 15.0 - 5.0
+# The client's LUT recurrence (bitwise-verified vs the game01 capture's
+# report.config, mscps=430) lives in core/growth.py so the sim's R3 growth law
+# and this obs schema share ONE source; re-exported here for the bridge and
+# for backwards compatibility of existing imports.
+from slither_gym.core.growth import (  # noqa: F401  (re-exports)
+    CLIENT_LUT_LEN,
+    CLIENT_MSCPS,
+    build_mass_luts,
+    real_mass,
+)
 
 
 # ---------------------------------------------------------------------------
