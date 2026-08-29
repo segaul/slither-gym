@@ -178,7 +178,15 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         self._snake_cache.reset()
 
         for i in range(1 + self._num_bots):
-            self._world.spawn_snake(i, mass=self._bot_spawn_mass() if i > 0 else None)
+            # Opponent starting size: P0.5 `bot_sct_law` wins when set (explicit
+            # mass); otherwise D6's world-level `spawn_mass_law` draws. Snake 0
+            # (the agent) always starts at initial_mass so the task stays
+            # comparable across every frozen eval.
+            self._world.spawn_snake(
+                i,
+                mass=self._bot_spawn_mass() if i > 0 else None,
+                sample_mass=(i != 0),
+            )
 
         # S4: re-sample the per-episode delay (resolved config) and seed the
         # FIFO with the RL snake's spawn heading / no boost, so the first
@@ -338,7 +346,10 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
                 if state is None or not state.alive:
                     # P0.5: respawns re-draw from the same size law, keeping the
                     # opponent size DISTRIBUTION stationary over the episode.
-                    self._world.spawn_snake(i, mass=self._bot_spawn_mass())
+                    # `sample_mass` is the D6 fallback when bot_sct_law is unset.
+                    self._world.spawn_snake(
+                        i, mass=self._bot_spawn_mass(), sample_mass=True
+                    )
                     # Reset stateful policies on respawn
                     if i in self._bot_policies and hasattr(self._bot_policies[i], 'reset'):
                         self._bot_policies[i].reset(i)

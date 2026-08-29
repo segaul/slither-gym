@@ -344,6 +344,17 @@ def realistic_world_config(
         corpse_value_law="real",
         corpse_mass_multiplier=CORPSE_MASS_MULTIPLIER_REAL,
         corpse_pellet_value_target=CORPSE_PELLET_VALUE_TARGET,
+        # R1: hold the FLOOR population at that density. Counting corpse pellets
+        # toward it let corpses switch floor spawning off for a whole episode.
+        density_counts_floor_only=True,
+        # D1/D3: the real economy is 79% corpse / 21% pellet, so the reward stream
+        # must be able to tell them apart. Legacy `remains_eaten` counted all food,
+        # double-paying floor pellets and making the corpse premium unrepresentable.
+        remains_counts_corpse_only=True,
+        # --- D6: measured real size distribution (sct p10 2 / p50 22 / p90 178 /
+        # max 262). Opponents only. This is what makes a corpse worth killing for:
+        # the premium comes from monsters existing, not from a corpse multiplier. ---
+        spawn_mass_law="real_sct",
         # --- C5: ~75 u measured (distance to nearest food when an eat fires).
         # mass_mult is 0.0 because the measurement resolves a single radius and
         # says nothing about size-dependence -- inventing a slope would be
@@ -389,8 +400,36 @@ def realistic_world_config(
         # value with no randomization range -- unlike the first pass, which had
         # to straddle two readings of grd.
         fields["map_radius"] = REAL_MAP_RADIUS
+    # R2: `max_food` must follow the map, or C1 (map radius) and C4 (food density)
+    # silently contradict each other. World._target_food_count clamps to
+    # max_food*3//4, so at radius 15000 the 43,825-pellet target was delivered as
+    # 12,288 -> 17.4 per 1e6 u^2 against the measured 62 (0.28x), while both units
+    # were reported as clean wins. Sized from the density target itself so the two
+    # cannot diverge again.
+    #
+    # MEASURED COST (25 snakes, 300 ticks): radius 15000 needs max_food 65536 to
+    # reach density 62, which runs 240 ticks/s vs 442 at the old cap -- a 1.84x
+    # throughput hit for ~0.9 MB. Memory is irrelevant; the time goes to
+    # FoodManager.collect_near, which scans the whole pool per snake per tick.
+    # A spatial index would remove it, but that is an optimization, not a fix.
+    fields.setdefault("max_food", _max_food_for(fields))
     fields.update(overrides)
     return WorldConfig(**fields)  # type: ignore[arg-type]
+
+
+def _max_food_for(fields: dict[str, object]) -> int:
+    """Smallest power-of-two pool that can actually hold the density target."""
+    density = float(fields.get("food_density_per_1e6") or 0.0)
+    radius = float(fields.get("map_radius") or 0.0)
+    default = int(WorldConfig.max_food)
+    if density <= 0.0 or radius <= 0.0:
+        return default
+    target = density * 3.141592653589793 * radius * radius / 1e6
+    needed = target / 0.75  # spawn_batch keeps a 25% free reserve for corpses
+    size = default
+    while size < needed:
+        size *= 2
+    return size
 
 
 # Fields that carry a documented (min, max) uncertainty range.

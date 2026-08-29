@@ -147,8 +147,9 @@ def test_r1_floor_count_bookkeeping_through_collect_and_evict() -> None:
     fm.spawn_at(0.0, 0.0, 12.1, corpse=True)
     assert fm.floor_count() == 20
     assert fm.alive_count() == 21
-    collected = fm.collect_near(0.0, 0.0, 1e9)  # eat everything
+    collected, corpse_collected = fm.collect_near(0.0, 0.0, 1e9)  # eat everything
     assert collected > 0
+    assert corpse_collected == pytest.approx(12.1)
     assert fm.floor_count() == 0
     assert fm.alive_count() == 0
 

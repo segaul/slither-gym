@@ -22,6 +22,8 @@ def compute_reward(
     reward: float = 0.0
 
     reward += result.mass_delta * 1.0
+    # E32: no linear remains_eaten term — food intake is already paid once via
+    # mass_delta; paying it again here double-counted every pellet.
     reward += result.kill_count * config.kill_reward_coef
     reward += config.survival_bonus
 

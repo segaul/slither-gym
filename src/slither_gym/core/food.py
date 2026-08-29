@@ -175,19 +175,26 @@ class FoodManager:
             self._floor_count += 1
         self._grid_add(idx)
 
-    def collect_near(self, x: float, y: float, radius: float) -> float:
-        """Remove all food within radius of (x, y). Returns total value collected.
+    def collect_near(self, x: float, y: float, radius: float) -> tuple[float, float]:
+        """Remove all food within radius of (x, y).
 
-        Bitwise contract: identical to the historical full-pool scan — the
-        candidate subset is ascending-ordered and a superset of any possible
+        Returns (total_value, corpse_value) — the second is the part that came from
+        corpse pellets. Splitting these is what makes "a kill is worth more than a
+        pellet" expressible at all: `_is_corpse` has been tracked since corpses were
+        added but was never read here, so `StepResult.remains_eaten` (documented as
+        "mass gained from corpse food specifically") in fact counted ALL food.
+
+        Bitwise contract: the total is identical to the historical full-pool scan —
+        the candidate subset is ascending-ordered and a superset of any possible
         hit, the distance test is the same float32 expression, and the value
-        sum runs over the same hit sequence (same pairwise summation)."""
+        sum runs over the same hit sequence (same pairwise summation).
+        """
         if self._count == 0:
-            return 0.0
+            return 0.0, 0.0
 
         cand = self._candidates(x, y, radius)
         if cand.size == 0:
-            return 0.0
+            return 0.0, 0.0
 
         pos = self._positions[cand]
         dx = pos[:, 0] - x
@@ -196,10 +203,14 @@ class FoodManager:
         hit = self._alive[cand] & (dist_sq < radius * radius)
 
         if not np.any(hit):
-            return 0.0
+            return 0.0, 0.0
 
+        # `hit` is a mask over `cand` (the cell-grid candidate subset), so it must
+        # be mapped back to global indices before touching the pool arrays.
         hit_indices = cand[hit]
         total = float(np.sum(self._values[hit_indices]))
+        corpse_indices = hit_indices[self._is_corpse[hit_indices]]
+        corpse = float(np.sum(self._values[corpse_indices]))
         self._alive[hit_indices] = False
         self._count -= len(hit_indices)
         self._floor_count -= int(np.count_nonzero(~self._is_corpse[hit_indices]))
@@ -207,7 +218,17 @@ class FoodManager:
         for i in hit_indices.tolist():
             self._grid_remove(i)
 
-        return total
+        return total, corpse
+
+    def alive_floor_count(self) -> int:
+        """Alive NON-corpse pellets.
+
+        R1: the density top-up used total `alive_count()`, which includes corpse
+        drops, so corpses suppressed floor-food spawning to zero (regular pellets
+        measured collapsing 1737 -> 4 over 20k ticks while corpse pellets filled
+        the pool). The floor population must be governed by floor pellets alone.
+        """
+        return int(np.count_nonzero(self._alive & ~self._is_corpse))
 
     def query_candidates(self, x: float, y: float, radius: float) -> NDArray[np.int64]:
         """READ-ONLY: ascending global indices of alive pellets in the padded

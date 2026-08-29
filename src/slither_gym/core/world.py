@@ -84,9 +84,30 @@ class World:
         target = self._target_food_count()
         return self._config.max_food // 2 if target is None else target
 
-    def spawn_snake(self, snake_id: int, mass: float | None = None) -> None:
-        """Spawn a snake at a random position within safe zone."""
+    def sample_spawn_mass(self) -> float:
+        """D6: draw a starting mass from the measured real size distribution."""
         config = self._config
+        if config.spawn_mass_law == "fixed":
+            return config.initial_mass
+        if config.spawn_mass_law == "real_sct":
+            m = float(
+                self._rng.lognormal(math.log(config.spawn_mass_median), config.spawn_mass_sigma)
+            )
+            return min(max(m, config.spawn_mass_min), config.spawn_mass_max)
+        raise ValueError(f"unknown spawn_mass_law: {config.spawn_mass_law!r}")
+
+    def spawn_snake(
+        self, snake_id: int, mass: float | None = None, sample_mass: bool = False
+    ) -> None:
+        """Spawn a snake at a random position within safe zone.
+
+        `sample_mass=True` draws from the D6 size distribution when no explicit mass
+        is given. Callers pass it for OPPONENTS only — the agent starting big would
+        silently change the task every frozen eval is defined against.
+        """
+        config = self._config
+        if mass is None and sample_mass:
+            mass = self.sample_spawn_mass()
         angle = float(self._rng.uniform(0, 2 * math.pi))
         dist = float(config.map_radius * 0.8 * math.sqrt(self._rng.uniform(0, 1)))
         x = dist * math.cos(angle)
@@ -215,7 +236,9 @@ class World:
                 state.segment_radius * config.collect_radius_mass_mult
                 + config.collect_radius_base
             )
-            collected = self._food.collect_near(state.head_x, state.head_y, collect_radius)
+            collected, corpse_collected = self._food.collect_near(
+                state.head_x, state.head_y, collect_radius
+            )
             if collected > 0:
                 # R3: pellet VALUE -> MASS conversion. Legacy is 1:1 (byte-
                 # identical); under growth_law="real" a unit of value is worth
@@ -225,13 +248,22 @@ class World:
                 # the real ~79x-slower segment growth.
                 if config.growth_law == "real":
                     gained = collected * config.pellet_mass_per_value
+                    gained_corpse = corpse_collected * config.pellet_mass_per_value
                 else:
                     gained = collected
+                    gained_corpse = corpse_collected
                 self._snakes.grow(sid, gained, self._segments)
                 start, end_new = self._snakes.get_segment_slice(sid)
                 self._seg_alive[start:end_new] = True
                 self._seg_owner[start:end_new] = sid
-                remains_eaten[sid] = gained
+                # Legacy default reports ALL collected food here (what E9-E30 trained
+                # against, and what every reward term calibrated to). Corpse-only is
+                # what the field's own docstring always claimed, and is required for
+                # D1 ("a kill is worth ~400 pellets") to be expressible at all.
+                # Reported in the same currency the snake actually gained (R3).
+                remains_eaten[sid] = (
+                    gained_corpse if config.remains_counts_corpse_only else gained
+                )
 
         # 6. Batch-spawn food
         self._tick += 1
@@ -247,8 +279,16 @@ class World:
                 # extra mass in flight and must not count against the ambient
                 # budget — under corpse_value_law='real' a single big kill
                 # (20x victim mass in pellets) would otherwise suppress floor
-                # spawning until the corpse is eaten.
-                self._food.spawn_batch(max(0, target - self._food.floor_count()))
+                # spawning until the corpse is eaten. Gated by
+                # density_counts_floor_only so the legacy default is unchanged;
+                # floor_count() is the O(1) counter equivalent of
+                # alive_floor_count()'s scan.
+                have = (
+                    self._food.floor_count()
+                    if config.density_counts_floor_only
+                    else self._food.alive_count()
+                )
+                self._food.spawn_batch(max(0, target - have))
 
         # 7. Build results
         results: dict[int, StepResult] = {}
