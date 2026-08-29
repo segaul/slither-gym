@@ -3,12 +3,32 @@ import math
 import numpy as np
 from numpy.typing import NDArray
 
+from slither_gym.core.growth import sct_fam_from_mass
 from slither_gym.core.types import SnakeState, WorldConfig
 
 
 def _expected_segments(mass: float, config: WorldConfig) -> int:
-    """How many segments a snake should have at a given mass."""
-    return max(config.initial_segments, config.initial_segments + int(mass - config.initial_mass))
+    """How many segments a snake should have at a given mass.
+
+    See WorldConfig.growth_law. "legacy" is one segment per mass unit
+    (byte-identical pre-R3 behavior); "real" derives sct from the client's
+    superlinear fpsls/fmlts law (core/growth.py), which is what slows segment
+    growth to the real game's timescale.
+    """
+    if config.growth_law == "legacy":
+        return max(config.initial_segments, config.initial_segments + int(mass - config.initial_mass))
+    if config.growth_law == "real":
+        return sct_fam_from_mass(mass)[0]
+    raise ValueError(f"unknown growth_law: {config.growth_law!r}")
+
+
+def initial_segment_count(config: WorldConfig) -> int:
+    """Segment count at spawn. Legacy: the configured initial_segments.
+    "real": the law-derived sct of initial_mass (= 2 at the default
+    initial_mass 10.0 — real snakes spawn at sct 2)."""
+    if config.growth_law == "real":
+        return _expected_segments(config.initial_mass, config)
+    return config.initial_segments
 
 
 def compute_segment_radius(mass: float, config: WorldConfig) -> float:
@@ -45,10 +65,17 @@ def compute_turn_rate(mass: float, config: WorldConfig) -> float:
         t = min(mass / config.max_mass, 1.0)
         return config.max_turn_rate - (config.max_turn_rate - config.min_turn_rate) * math.sqrt(t)
     if config.turn_rate_law == "real_sct":
-        # Continuous in mass on purpose: _expected_segments' int() truncation
-        # would put a 1-segment-wide staircase in the angular rate. Agrees with
-        # _expected_segments exactly at integer mass.
-        sct = config.initial_segments + (mass - config.initial_mass)
+        # Continuous in mass on purpose: _expected_segments' truncation would
+        # put a 1-segment-wide staircase in the angular rate.
+        if config.growth_law == "real":
+            # R3: continuous size = sct + fam from the client LUT inverse, so
+            # the turn law reads the LAW-DERIVED sct and reaches its sct-256
+            # endpoint on the real growth timescale.
+            s, fam = sct_fam_from_mass(mass)
+            sct = s + fam
+        else:
+            # Legacy currency: agrees with _expected_segments at integer mass.
+            sct = config.initial_segments + (mass - config.initial_mass)
         span = config.turn_sct_ref_hi - config.turn_sct_ref_lo
         u = (sct - config.turn_sct_ref_lo) / span
         u = min(max(u, 0.0), 1.0)
@@ -80,7 +107,7 @@ class SnakeManager:
     ) -> SnakeState:
         config = self._config
         start = snake_id * self._max_seg
-        seg_count = config.initial_segments
+        seg_count = initial_segment_count(config)
 
         dx = -math.cos(angle) * config.segment_spacing
         dy = -math.sin(angle) * config.segment_spacing
@@ -130,11 +157,16 @@ class SnakeManager:
             return
         config = self._config
 
-        # Hoisted above the turn clamp because the clamp now depends on it (A4).
-        # Behaviour-preserving: the predicate reads only `boost`, state.mass and
-        # config.initial_mass, and nothing between here and the old site (the
-        # mass decrement) writes any of them.
-        is_boosting = bool(boost) and state.mass > config.initial_mass
+        # Hoisted above the turn clamp because the clamp depends on it (A4).
+        #
+        # P0.2 (state-space V5): boost ALWAYS engages when commanded. The old
+        # predicate `boost and mass > initial_mass` refused boost at floor mass,
+        # which dropped 99% of commanded boost ticks in real-capture replays
+        # (humans boost constantly at sct 2-6, which maps to the sim's floor).
+        # Real slither.io lets any snake at/above spawn mass boost; the floor
+        # only stops the DRAIN, not the boost itself. That semantics lives in
+        # the mass clamp below; above the floor, behaviour is identical.
+        is_boosting = bool(boost)
 
         # Turn toward target angle
         target_angle = math.atan2(target_sin, target_cos)
@@ -149,13 +181,24 @@ class SnakeManager:
 
         # Boost
         if is_boosting:
-            speed = config.boost_speed
+            target_speed = config.boost_speed
+            # Drain clamps at spawn mass: boosting at the floor costs nothing
+            # but still moves at boost_speed (P0.2, matches real slither.io).
             state.mass -= config.boost_mass_cost_per_tick
             state.mass = max(state.mass, config.initial_mass)
             state.boosting = True
         else:
-            speed = config.base_speed
+            target_speed = config.base_speed
             state.boosting = False
+
+        # A2b boost ramp: speed INCREASES are rate-limited (measured ~469 u/s^2
+        # onset ramp); decreases are instant (measured: release drops to base
+        # within one client frame). None = legacy instant onset, byte-identical.
+        ramp = config.boost_ramp_up_per_tick
+        if ramp is not None and target_speed > state.speed:
+            speed = min(state.speed + ramp, target_speed)
+        else:
+            speed = target_speed
 
         # Advance head
         new_hx = state.head_x + math.cos(new_angle) * speed
@@ -226,16 +269,38 @@ class SnakeManager:
         end = int(self._seg_ends[snake_id])
         config = self._config
 
-        mass_ratio = min(state.mass / config.max_mass, 1.0)
-        pellet_value = config.corpse_food_base + (config.corpse_food_scale - config.corpse_food_base) * math.sqrt(mass_ratio)
-
         corpse: list[tuple[float, float, float]] = []
-        for i in range(start, end):
-            corpse.append((
-                float(segments[i, 0]),
-                float(segments[i, 1]),
-                pellet_value,
-            ))
+        if config.corpse_value_law == "legacy":
+            # Pre-P0.3 law, byte-identical: one pellet per segment worth
+            # ~2.0-2.2, so a corpse returns roughly the victim's own mass.
+            mass_ratio = min(state.mass / config.max_mass, 1.0)
+            pellet_value = config.corpse_food_base + (config.corpse_food_scale - config.corpse_food_base) * math.sqrt(mass_ratio)
+            for i in range(start, end):
+                corpse.append((
+                    float(segments[i, 0]),
+                    float(segments[i, 1]),
+                    pellet_value,
+                ))
+        elif config.corpse_value_law == "real":
+            # D1/P0.3: total corpse value = corpse_mass_multiplier * mass
+            # (measured: real corpses are worth ~20x what the legacy sim
+            # drops). The per-segment budget is split into however many
+            # pellets it takes for each pellet's value to land near
+            # corpse_pellet_value_target (12.1, the midpoint of the observed
+            # 10-14.2 high-value tail). value = budget / n conserves the
+            # total EXACTLY regardless of rounding.
+            seg_count = end - start
+            if seg_count > 0:
+                budget = config.corpse_mass_multiplier * state.mass / seg_count
+                n = max(1, round(budget / config.corpse_pellet_value_target))
+                pellet_value = budget / n
+                for i in range(start, end):
+                    x = float(segments[i, 0])
+                    y = float(segments[i, 1])
+                    for _ in range(n):
+                        corpse.append((x, y, pellet_value))
+        else:
+            raise ValueError(f"unknown corpse_value_law: {config.corpse_value_law!r}")
 
         state.alive = False
         state.segment_count = 0

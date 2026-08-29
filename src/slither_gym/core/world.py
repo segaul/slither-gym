@@ -240,7 +240,19 @@ class World:
                 state.head_x, state.head_y, collect_radius
             )
             if collected > 0:
-                self._snakes.grow(sid, collected, self._segments)
+                # R3: pellet VALUE -> MASS conversion. Legacy is 1:1 (byte-
+                # identical); under growth_law="real" a unit of value is worth
+                # pellet_mass_per_value (~0.208) mass in the client's own
+                # currency, so a mean pellet (6.25) grants ~1.3 mass — and the
+                # superlinear LUT law in _expected_segments turns that into
+                # the real ~79x-slower segment growth.
+                if config.growth_law == "real":
+                    gained = collected * config.pellet_mass_per_value
+                    gained_corpse = corpse_collected * config.pellet_mass_per_value
+                else:
+                    gained = collected
+                    gained_corpse = corpse_collected
+                self._snakes.grow(sid, gained, self._segments)
                 start, end_new = self._snakes.get_segment_slice(sid)
                 self._seg_alive[start:end_new] = True
                 self._seg_owner[start:end_new] = sid
@@ -248,8 +260,9 @@ class World:
                 # against, and what every reward term calibrated to). Corpse-only is
                 # what the field's own docstring always claimed, and is required for
                 # D1 ("a kill is worth ~400 pellets") to be expressible at all.
+                # Reported in the same currency the snake actually gained (R3).
                 remains_eaten[sid] = (
-                    corpse_collected if config.remains_counts_corpse_only else collected
+                    gained_corpse if config.remains_counts_corpse_only else gained
                 )
 
         # 6. Batch-spawn food
@@ -262,11 +275,16 @@ class World:
                 # Top back up to the density target instead of adding a fixed
                 # count, so the steady-state pellet population is the measured
                 # density rather than an emergent spawn/eat equilibrium.
-                # R1: count FLOOR pellets only. Using the total (which includes corpse
-                # drops) let a few corpses push alive_count past the target and shut
-                # floor spawning off entirely for the rest of the episode.
+                # R1: compare against FLOOR pellets only. Corpse pellets are
+                # extra mass in flight and must not count against the ambient
+                # budget — under corpse_value_law='real' a single big kill
+                # (20x victim mass in pellets) would otherwise suppress floor
+                # spawning until the corpse is eaten. Gated by
+                # density_counts_floor_only so the legacy default is unchanged;
+                # floor_count() is the O(1) counter equivalent of
+                # alive_floor_count()'s scan.
                 have = (
-                    self._food.alive_floor_count()
+                    self._food.floor_count()
                     if config.density_counts_floor_only
                     else self._food.alive_count()
                 )
@@ -310,3 +328,7 @@ class World:
 
     def get_tick(self) -> int:
         return self._tick
+
+    def get_config(self) -> WorldConfig:
+        """Read-only view of the resolved config this world was built with."""
+        return self._config

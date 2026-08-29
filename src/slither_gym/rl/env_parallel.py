@@ -12,6 +12,15 @@ from pettingzoo import ParallelEnv
 from slither_gym.core.realism import sample_world_config
 from slither_gym.core.types import WorldConfig
 from slither_gym.core.world import World
+from slither_gym.obs.schema_v5 import ObsConfigV5
+from slither_gym.rl.action_delay import ActionDelayQueue
+from slither_gym.rl.env_obs_v5 import (
+    LastAction,
+    v5_empty_obs,
+    v5_initial_last_action,
+    v5_observation_space,
+    v5_observe,
+)
 from slither_gym.rl.obs_processor import compute_observation
 from slither_gym.rl.reward import compute_reward
 from slither_gym.rl.types import AgentId, EnemySnakeInfo, ObsConfig, RawGameState
@@ -33,12 +42,22 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
         max_ticks: int = 3000,
         seed: int = 0,
         render_mode: str | None = None,
+        obs_schema: str = "v4",
+        obs_config_v5: ObsConfigV5 | None = None,
     ) -> None:
         super().__init__()
+        if obs_schema not in ("v4", "v5"):
+            raise ValueError(f"obs_schema must be 'v4' or 'v5', got {obs_schema!r}")
         # See SlitherGymEnv: base = pristine, _world_config = per-episode resolved.
         self._base_world_config = world_config
         self._world_config = world_config
         self._obs_config = obs_config
+        # S5: opt-in deployable obs (schema_v5). 'v4' keeps the legacy
+        # obs_processor path byte-identical.
+        self._obs_schema = obs_schema
+        self._obs_config_v5 = obs_config_v5 or ObsConfigV5()
+        # S5: per-agent last COMMANDED action (see env_obs_v5 docstring).
+        self._last_commanded: dict[int, LastAction] = {}
         self._num_agents = num_agents
         self._max_ticks = max_ticks
         self._seed = seed
@@ -46,6 +65,9 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
 
         self._world: World | None = None
         self._tick_count: int = 0
+        # S4: per-agent latency FIFOs. EVERY agent here is externally
+        # commanded (this env has no scripted bots), so all are delayed.
+        self._action_delays: dict[int, ActionDelayQueue] = {}
 
         self.possible_agents: list[AgentId] = [
             f"snake_{i}" for i in range(num_agents)
@@ -75,6 +97,20 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
 
         for i in range(self._num_agents):
             self._world.spawn_snake(i)
+
+        # S4: per-episode delay (constant within the episode, re-sampled by
+        # sample_world_config above when DR is on); each queue seeds with its
+        # snake's spawn heading / no boost.
+        states = self._world.get_snake_states()
+        self._action_delays = {}
+        self._last_commanded = {}
+        for i in range(self._num_agents):
+            q = ActionDelayQueue(self._world_config.action_delay_ticks)
+            q.seed(states[i].angle)
+            self._action_delays[i] = q
+            # S5: seed last-commanded with the spawn heading / no boost,
+            # exactly like the delay queue.
+            self._last_commanded[i] = v5_initial_last_action(states[i].angle)
 
         observations = self._get_observations()
         infos: dict[AgentId, dict[str, Any]] = {agent: {} for agent in self.agents}
@@ -106,13 +142,24 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
                 sin_a = 0.0
             boost = bool(action[2] > 0.5)
             world_actions[snake_idx] = (cos_a, sin_a, boost)
+            # S5: record the COMMANDED (pre-delay-queue) action; the v5 obs
+            # feeds this back as self_state[7] and [9:12] next step.
+            self._last_commanded[snake_idx] = (
+                cos_a, sin_a, 1.0 if boost else 0.0
+            )
 
         accumulated_rewards: dict[AgentId, float] = {agent: 0.0 for agent in self.agents}
         terminations: dict[AgentId, bool] = {agent: False for agent in self.agents}
         current_agents = list(self.agents)
 
         for _ in range(self._world_config.step_mul):
-            results = self._world.step(world_actions)
+            # S4: per-tick FIFO per agent — apply the action commanded
+            # `delay` ticks ago. No-op when action_delay_ticks == 0.
+            applied = {
+                sid: self._action_delays[sid].apply(act)
+                for sid, act in world_actions.items()
+            }
+            results = self._world.step(applied)
             self._tick_count += 1
 
             for agent_id in current_agents:
@@ -149,6 +196,8 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
 
     @functools.lru_cache(maxsize=1)
     def observation_space(self, agent: AgentId) -> gymnasium.spaces.Dict:
+        if self._obs_schema == "v5":
+            return v5_observation_space(self._obs_config_v5)
         obs_config = self._obs_config
         return gymnasium.spaces.Dict({
             "self_state": gymnasium.spaces.Box(
@@ -197,6 +246,20 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
     def _get_observations(self) -> dict[AgentId, dict[str, NDArray[np.float32]]]:
         assert self._world is not None
         observations: dict[AgentId, dict[str, NDArray[np.float32]]] = {}
+
+        # S5: the deployable obs path — visibility mask + canonical build_obs.
+        if self._obs_schema == "v5":
+            states_v5 = self._world.get_snake_states()
+            for agent_id in self.agents:
+                snake_idx = int(agent_id.split("_")[1])
+                st = states_v5.get(snake_idx)
+                if st is None or not st.alive:
+                    continue
+                observations[agent_id] = v5_observe(
+                    self._world, snake_idx, self._obs_config_v5,
+                    self._last_commanded[snake_idx],
+                )
+            return observations
 
         states = self._world.get_snake_states()
         food_pos = self._world.get_food_positions()
@@ -281,6 +344,8 @@ class SlitherParallelEnv(ParallelEnv):  # type: ignore[misc]
         return observations
 
     def _empty_obs(self) -> dict[str, NDArray[np.float32]]:
+        if self._obs_schema == "v5":
+            return v5_empty_obs(self._obs_config_v5)
         obs_config = self._obs_config
         return {
             "self_state": np.zeros(12, dtype=np.float32),

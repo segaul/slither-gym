@@ -11,6 +11,7 @@ import math
 import numpy as np
 import pytest
 
+from slither_gym.core.growth import real_mass, real_mass_continuous
 from slither_gym.core.realism import (
     REAL_TURN_RATE_BINS,
     TICK_HZ,
@@ -84,19 +85,23 @@ def test_a1_a2_speeds_match_measured_units_per_second() -> None:
 
 @pytest.mark.parametrize("sct,expected_rad_per_s", REAL_TURN_RATE_BINS)
 def test_a3_turn_curve_matches_measured_p95_bins(sct: float, expected_rad_per_s: float) -> None:
+    # R3: the preset's mass currency is the client's own, so sct -> mass goes
+    # through the LUT law rather than the legacy 1-mass-per-segment identity.
     c = realistic_world_config()
-    mass = c.initial_mass + (sct - c.initial_segments)
+    mass = real_mass_continuous(sct)
     assert compute_turn_rate(mass, c) * TICK_HZ == pytest.approx(expected_rad_per_s, abs=0.08)
 
 
 def test_a3_endpoint_span_matches_the_real_1_9x_range() -> None:
     c = realistic_world_config()
-    span = compute_turn_rate(10.0, c) / compute_turn_rate(256.0, c)
+    span = compute_turn_rate(real_mass_continuous(10.0), c) / compute_turn_rate(
+        real_mass_continuous(256.0), c
+    )
     assert span == pytest.approx(2.13, abs=0.02)
     # Over the six measured bin representatives the realized span is the ~1.9x
     # the measurement reports (the endpoint span is wider because sct=256 is an
     # extrapolation past the last bin).
-    rates = [compute_turn_rate(c.initial_mass + (s - 10), c) for s, _ in REAL_TURN_RATE_BINS]
+    rates = [compute_turn_rate(real_mass_continuous(s), c) for s, _ in REAL_TURN_RATE_BINS]
     assert max(rates) / min(rates) == pytest.approx(1.94, abs=0.05)
 
 
@@ -180,16 +185,19 @@ def test_state_turn_rate_stays_the_unboosted_base_rate() -> None:
 
 @pytest.mark.parametrize("sct", [2, 10, 22, 100, 178, 256])
 def test_b1_width_follows_the_measured_sc_law_exactly(sct: int) -> None:
+    # R3: sct -> mass via the client LUT law (the preset's currency). The old
+    # sct-10 floor is gone with it: real-growth snakes reach the client's own
+    # minimum sct 2, where sc == 1 exactly.
     c = realistic_world_config()
-    mass = c.initial_mass + (sct - c.initial_segments)
-    sc = 1.0 + (max(sct, c.initial_segments) - 2.0) / 106.0  # sim floors at sct=10
+    mass = real_mass(sct, 0.0)
+    sc = 1.0 + (sct - 2.0) / 106.0
     assert compute_segment_radius(mass, c) == pytest.approx(c.body_radius_base * sc)
 
 
 def test_b1_span_approaches_the_measured_3_45x() -> None:
     c = realistic_world_config()
-    lo = compute_segment_radius(c.initial_mass, c)                      # sct 10
-    hi = compute_segment_radius(c.initial_mass + 246, c)                # sct 256
+    lo = compute_segment_radius(real_mass(10, 0.0), c)                  # sct 10
+    hi = compute_segment_radius(real_mass(256, 0.0), c)                 # sct 256
     assert hi / lo == pytest.approx(3.16, abs=0.02)
     # ...versus the legacy law's reachable span, which is nearly flat. This is
     # the real defect B1 fixes: the sim was too FLAT, not too fat.
@@ -273,6 +281,150 @@ def test_c4_food_density_is_scale_free(radius: float) -> None:
     assert world._food.alive_count() == pytest.approx(expected, rel=0.01)
 
 
+def test_a2b_boost_ramp_matches_the_measured_spin_up() -> None:
+    """Onset ramp 469 u/s^2 -> 0.2931 u/tick^2; full 181.5 -> 373 u/s spin-up
+    in ceil((9.325-4.5375)/0.2931) = 17 ticks (~0.41 s). Legacy default: None."""
+    c = realistic_world_config()
+    assert c.boost_ramp_up_per_tick == pytest.approx(469.0 / 1600.0)
+    ticks_to_full = math.ceil((c.boost_speed - c.base_speed) / c.boost_ramp_up_per_tick)
+    assert ticks_to_full == 17  # ~0.41 s at 40 Hz, matching the measured ~0.40 s
+    assert WorldConfig().boost_ramp_up_per_tick is None
+
+
+def test_c3_food_value_law_is_real_with_iqr_fallback() -> None:
+    """P0.3: the preset ships the mixture law; the IQR-uniform stopgap survives
+    only as the min/max fallback fields, which the 'real' law never reads."""
+    c = realistic_world_config()
+    assert c.food_value_law == "real"
+    assert (c.food_value_min, c.food_value_max) == (4.8, 6.2)
+    lc = WorldConfig()
+    assert lc.food_value_law == "legacy"
+    assert (lc.food_value_min, lc.food_value_max) == (1.0, 3.0)
+
+
+def test_d4_boost_cost_point_is_mid_band() -> None:
+    """D4 is a band (-0.1..-0.5 mass/s); the deterministic point value sits at
+    the band centre-of-belief 0.25 mass/s = 0.00625 mass/tick, not the cheapest
+    edge, and the DR range still spans the full band."""
+    c = realistic_world_config()
+    assert c.boost_mass_cost_per_tick == pytest.approx(0.00625)
+    assert c.boost_mass_cost_per_tick_min == pytest.approx(0.1 / 40)
+    assert c.boost_mass_cost_per_tick_max == pytest.approx(0.5 / 40)
+    # Legacy default untouched (10-50x too high, but frozen for E-series).
+    assert WorldConfig().boost_mass_cost_per_tick == 0.125
+
+
+def test_p03_real_food_value_distribution_shape() -> None:
+    """Acceptance for the C3 mixture law against the measured 8-game set:
+    min 3.0, p25 4.8, p50 5.2, p75 6.2, tail to 14.2, mean 6.25 +/- 0.3."""
+    from slither_gym.core.food import FoodManager
+    c = realistic_world_config()
+    mgr = FoodManager(c, np.random.default_rng(42))
+    draws = np.array([mgr._sample_value() for _ in range(100_000)])
+
+    assert draws.min() >= 3.0
+    assert draws.max() <= 14.2
+    assert float(draws.mean()) == pytest.approx(6.25, abs=0.3)
+    p25, p50, p75 = np.percentile(draws, [25, 50, 75])
+    assert p25 == pytest.approx(4.8, abs=0.3)
+    assert p50 == pytest.approx(5.2, abs=0.3)
+    assert p75 == pytest.approx(6.2, abs=0.3)
+    # The tail is a real component, not noise: its weight is the preset's w.
+    tail_frac = float((draws >= c.food_tail_lo).mean())
+    assert tail_frac == pytest.approx(c.food_tail_weight, abs=0.01)
+
+
+def test_p03_legacy_food_values_are_byte_identical() -> None:
+    """The legacy law must make the IDENTICAL RNG call the pre-P0.3 inline
+    code made, so every seeded pre-existing run replays bit-exactly."""
+    from slither_gym.core.food import FoodManager
+    c = WorldConfig()
+    mgr = FoodManager(c, np.random.default_rng(7))
+    mgr.spawn_batch(500)
+    got = mgr.get_alive_values()
+
+    ref_rng = np.random.default_rng(7)
+    ref = []
+    for _ in range(500):
+        ref_rng.uniform(0, 2 * np.pi)     # angle
+        ref_rng.uniform(0, 1)             # dist
+        ref.append(ref_rng.uniform(c.food_value_min, c.food_value_max))
+    assert np.array_equal(np.sort(got), np.sort(np.float32(ref)))
+
+
+def test_p03_unknown_food_value_law_fails_loudly() -> None:
+    import dataclasses
+    from slither_gym.core.food import FoodManager
+    c = dataclasses.replace(WorldConfig(), food_value_law="nope")
+    mgr = FoodManager(c, np.random.default_rng(0))
+    with pytest.raises(ValueError):
+        mgr._sample_value()
+
+
+# --------------------------------------------------------------------------
+# 5b. D1/P0.3 corpse value
+# --------------------------------------------------------------------------
+
+def _killed_corpse(config: WorldConfig, mass: float) -> list[tuple[float, float, float]]:
+    segments = np.zeros((config.max_snakes * config.max_segments_per_snake, 2), dtype=np.float32)
+    mgr = SnakeManager(config)
+    st = mgr.spawn(0, 0.0, 0.0, 0.0, segments)
+    st.mass = mass
+    # Grow the segment chain to match the mass before dying.
+    for _ in range(300):
+        mgr.move(0, 1.0, 0.0, False, segments)
+    return mgr.kill(0, segments)
+
+
+@pytest.mark.parametrize("mass", [10.0, 100.0, 1000.0])
+def test_p03_corpse_total_value_is_conserved_at_the_multiplier(mass: float) -> None:
+    """Total corpse value == corpse_mass_multiplier * victim mass, EXACTLY
+    (up to float summation), regardless of segment count or pellet rounding."""
+    c = realistic_world_config()
+    corpse = _killed_corpse(c, mass)
+    assert corpse
+    total = sum(v for _, _, v in corpse)
+    assert total == pytest.approx(c.corpse_mass_multiplier * mass, rel=1e-6)
+
+
+def test_p03_corpse_pellets_sit_in_the_observed_tail() -> None:
+    """Corpse pellets are the 10-14.2 tail of the measured value distribution.
+    The per-pellet value must land near the 12.1 target -- always within a
+    factor set by the rounding of pellets-per-segment."""
+    c = realistic_world_config()
+    for mass in (50.0, 400.0, 2500.0):
+        corpse = _killed_corpse(c, mass)
+        values = {v for _, _, v in corpse}
+        assert len(values) == 1  # even split
+        (v,) = values
+        # n = max(1, round(budget/target)) keeps v within ~2/3x..2x of target
+        # for any budget >= target/2; the interesting sizes sit much closer.
+        assert 0.5 * c.corpse_pellet_value_target <= v <= 2.0 * c.corpse_pellet_value_target
+
+
+def test_p03_corpse_value_law_legacy_is_byte_identical() -> None:
+    """Under defaults the corpse must be EXACTLY the pre-P0.3 output: one
+    pellet per segment worth base + (scale-base)*sqrt(mass/max_mass)."""
+    c = WorldConfig()
+    mass = 123.0
+    corpse = _killed_corpse(c, mass)
+    assert corpse
+    expected = c.corpse_food_base + (c.corpse_food_scale - c.corpse_food_base) * math.sqrt(
+        min(mass / c.max_mass, 1.0)
+    )
+    values = {v for _, _, v in corpse}
+    assert values == {expected}
+    # One pellet per segment -- positions must be pairwise distinct.
+    assert len({(x, y) for x, y, _ in corpse}) == len(corpse)
+
+
+def test_p03_unknown_corpse_value_law_fails_loudly() -> None:
+    import dataclasses
+    c = dataclasses.replace(WorldConfig(), corpse_value_law="nope")
+    with pytest.raises(ValueError):
+        _killed_corpse(c, 100.0)
+
+
 def test_c4_legacy_food_regime_is_untouched() -> None:
     c = WorldConfig()
     assert World(c, seed=0)._food.alive_count() == c.max_food // 2
@@ -302,9 +454,24 @@ def test_randomization_covers_the_documented_uncertainty() -> None:
     # D4 boost mass cost is BOUNDED, not point-measured: a band, never a point.
     assert min(d.boost_mass_cost_per_tick for d in draws) >= 0.1 / 40
     assert max(d.boost_mass_cost_per_tick for d in draws) <= 0.5 / 40
-    # R0 is not measured at all.
-    assert min(d.body_radius_base for d in draws) >= 6.5 * 0.7
+    # R0 is not measured at all. Low edge clipped at 4.68 (R3: sct-2 spawns
+    # bind the anti-tunneling invariant; see BODY_RADIUS_BASE_MIN_FLOOR).
+    assert min(d.body_radius_base for d in draws) >= 4.68
     assert max(d.body_radius_base for d in draws) <= 6.5 * 1.3
+    # P0.3/R3: corpse multiplier is inferred (not counted) -- +/-50% band
+    # around the real-currency 1.594 (the M3 gorge anchor).
+    assert min(d.corpse_mass_multiplier for d in draws) >= 0.797
+    assert max(d.corpse_mass_multiplier for d in draws) <= 2.391
+    assert len({d.corpse_mass_multiplier for d in draws}) > 100  # actually sampled
+    # R3: mass-per-pellet-value is a ratio of two measurements -- +/-30% band;
+    # the LUT law itself is exact and must NOT be randomized (no field for it).
+    assert min(d.pellet_mass_per_value for d in draws) >= 0.208 * 0.7
+    assert max(d.pellet_mass_per_value for d in draws) <= 0.208 * 1.3
+    assert len({d.pellet_mass_per_value for d in draws}) > 100
+    # P0.3: food tail weight is solved from the mean constraint, so it is banded.
+    assert min(d.food_tail_weight for d in draws) >= 0.10
+    assert max(d.food_tail_weight for d in draws) <= 0.20
+    assert len({d.food_tail_weight for d in draws}) > 100
     # Every sampled world must still satisfy the discretization invariants.
     for d in draws:
         World(d, seed=0)

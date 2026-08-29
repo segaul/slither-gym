@@ -85,18 +85,84 @@ def test_boost() -> None:
     )
 
 
-def test_boost_floor() -> None:
-    """Can't boost below initial mass."""
+def test_boost_engages_at_floor_mass() -> None:
+    """P0.2: boost always engages, even at spawn mass — the floor only stops
+    the drain. (The old gate refused boost at floor mass, which dropped 99% of
+    commanded boost ticks when replaying real captures at sct 2-6.)"""
     config = WorldConfig()
     mgr = SnakeManager(config)
     segments = _make_segments(config)
 
     state = mgr.spawn(0, 0.0, 0.0, 0.0, segments)
-    # At initial mass, boost should not activate
+    assert state.mass == config.initial_mass
     mgr.move(0, 1.0, 0.0, True, segments)
     state = mgr.get_state(0)
-    assert not state.boosting
-    assert state.speed == config.base_speed
+    assert state.boosting
+    assert state.speed == config.boost_speed
+    # ...but mass cannot go below the spawn floor.
+    assert state.mass == config.initial_mass
+
+
+def test_boost_drain_clamps_at_floor() -> None:
+    """Mass above the floor drains per-tick, then sticks exactly at the floor
+    while boost stays engaged."""
+    config = WorldConfig()
+    mgr = SnakeManager(config)
+    segments = _make_segments(config)
+
+    mgr.spawn(0, 0.0, 0.0, 0.0, segments)
+    surplus = 2.5 * config.boost_mass_cost_per_tick
+    mgr.grow(0, surplus, segments)
+
+    # Drains down: 2 full-cost ticks, then a partial tick hits the floor.
+    for _ in range(3):
+        mgr.move(0, 1.0, 0.0, True, segments)
+    state = mgr.get_state(0)
+    assert state.mass == config.initial_mass
+
+    # Further boosting keeps engaging at boost_speed with zero net drain.
+    for _ in range(10):
+        mgr.move(0, 1.0, 0.0, True, segments)
+    state = mgr.get_state(0)
+    assert state.boosting
+    assert state.speed == config.boost_speed
+    assert state.mass == config.initial_mass
+
+
+def test_boost_onset_is_instant_under_legacy_defaults() -> None:
+    """boost_ramp_up_per_tick=None (default) keeps the old instant-onset model,
+    so E-series runs and frozen evals stay byte-identical."""
+    config = WorldConfig()
+    assert config.boost_ramp_up_per_tick is None
+    mgr = SnakeManager(config)
+    segments = _make_segments(config)
+    mgr.spawn(0, 0.0, 0.0, 0.0, segments)
+    mgr.grow(0, 20.0, segments)
+    mgr.move(0, 1.0, 0.0, True, segments)
+    assert mgr.get_state(0).speed == config.boost_speed
+
+
+def test_boost_ramp_limits_onset_and_release_is_instant() -> None:
+    """A2b: with a ramp configured, speed climbs by at most `ramp` per tick on
+    the way up, saturates at boost_speed, and snaps back to base on release."""
+    import dataclasses
+    config = dataclasses.replace(WorldConfig(), boost_ramp_up_per_tick=0.5)
+    mgr = SnakeManager(config)
+    segments = _make_segments(config)
+    mgr.spawn(0, 0.0, 0.0, 0.0, segments)
+    mgr.grow(0, 100.0, segments)
+
+    speeds = []
+    for _ in range(10):
+        mgr.move(0, 1.0, 0.0, True, segments)
+        speeds.append(mgr.get_state(0).speed)
+    # base 3.0 -> boost 6.0 in 0.5/tick steps: 3.5, 4.0, ... 6.0, then flat.
+    np.testing.assert_allclose(speeds[:6], [3.5, 4.0, 4.5, 5.0, 5.5, 6.0], atol=1e-6)
+    assert speeds[-1] == config.boost_speed
+
+    # Release: back to base_speed in ONE tick, no ramp down.
+    mgr.move(0, 1.0, 0.0, False, segments)
+    assert mgr.get_state(0).speed == config.base_speed
 
 
 def test_grow() -> None:

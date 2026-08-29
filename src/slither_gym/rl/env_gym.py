@@ -7,10 +7,19 @@ import gymnasium
 import numpy as np
 from numpy.typing import NDArray
 
+from slither_gym.core.growth import real_mass_continuous
 from slither_gym.core.realism import sample_world_config
 from slither_gym.core.types import WorldConfig
 from slither_gym.core.world import World
+from slither_gym.obs.schema_v5 import ObsConfigV5
+from slither_gym.rl.action_delay import ActionDelayQueue
 from slither_gym.rl.bot_policy import BotPolicy
+from slither_gym.rl.env_obs_v5 import (
+    LastAction,
+    v5_empty_obs,
+    v5_initial_last_action,
+    v5_observe,
+)
 from slither_gym.rl.env_parallel import SlitherParallelEnv
 from slither_gym.rl.obs_processor import compute_observation
 from slither_gym.rl.reward import compute_reward
@@ -36,8 +45,24 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         render_mode: str | None = None,
         respawn_bots: bool = True,
         bot_policies: dict[int, Any] | None = None,
+        obs_schema: str = "v4",
+        obs_config_v5: ObsConfigV5 | None = None,
+        bot_sct_law: str | None = None,
+        bot_sct_log_median: float = 22.0,
+        bot_sct_log_sigma: float = 1.632,
+        bot_sct_min: float = 2.0,
+        bot_sct_max: float = 256.0,
     ) -> None:
         super().__init__()
+        if obs_schema not in ("v4", "v5"):
+            raise ValueError(f"obs_schema must be 'v4' or 'v5', got {obs_schema!r}")
+        # S5: opt-in deployable obs for the RL AGENT ONLY. Bots always stay on
+        # the V4 obs path — scripted BotPolicy and every frozen self-play
+        # checkpoint consume V4 observations; they model other players, not
+        # the deployable agent.
+        self._obs_schema = obs_schema
+        self._obs_config_v5 = obs_config_v5 or ObsConfigV5()
+        self._last_commanded_rl: LastAction = (1.0, 0.0, 0.0)
         # The pristine config. `_world_config` is the per-episode RESOLVED one
         # (identical to this unless world_config.randomize_physics is set);
         # sampling always starts from the base so jitter cannot compound.
@@ -49,6 +74,27 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         self._seed = seed
         self._respawn_bots = respawn_bots
         self._render_mode = render_mode
+
+        # P0.5 (frozen_eval_v8): opponent SIZE distribution. Real slither.io
+        # opponents span sct 2-262 (measured p10 2, p50 22, p90 178 — 8-game
+        # consolidated set, docs/SIM_REALISM_STATE.md), while the legacy sim
+        # spawns every bot at initial_mass. When bot_sct_law == "lognormal",
+        # each BOT (never the RL agent, snake 0) spawns AND respawns with
+        #   sct ~ clip(lognormal(median=bot_sct_log_median,
+        #                        sigma=bot_sct_log_sigma),
+        #              bot_sct_min, bot_sct_max)
+        # converted to mass via mass = initial_mass + (sct - initial_segments)
+        # (the inverse of snake.py's sct formula). None (default) draws NO RNG
+        # and spawns at initial_mass — byte-identical to every pre-P0.5 run.
+        if bot_sct_law not in (None, "lognormal"):
+            raise ValueError(
+                f"bot_sct_law must be None or 'lognormal', got {bot_sct_law!r}"
+            )
+        self._bot_sct_law = bot_sct_law
+        self._bot_sct_log_median = float(bot_sct_log_median)
+        self._bot_sct_log_sigma = float(bot_sct_log_sigma)
+        self._bot_sct_min = float(bot_sct_min)
+        self._bot_sct_max = float(bot_sct_max)
 
         self._world: World | None = None
         self._rng = np.random.default_rng(seed)
@@ -69,6 +115,8 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             num_agents=1 + num_bots,
             max_ticks=max_ticks,
             seed=seed,
+            obs_schema=obs_schema,
+            obs_config_v5=obs_config_v5,
         )
 
         self.observation_space = self._parallel_env.observation_space(self._rl_agent_id)
@@ -76,10 +124,19 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
 
         self._snake_cache = SnakeCache(max_slots=obs_config.k_enemies)
         self._bot_obs_cache: dict[int, dict[str, NDArray[np.float32]]] = {}
+        # Bots whose cached obs is the scripted-BotPolicy PARTIAL build (only
+        # the fields BotPolicy consumes; see _compute_bot_observation_fast).
+        # Policy-driven bots must never be fed one of these.
+        self._bot_obs_partial: set[int] = set()
         # E29 per-snake obs: distinct-k_danger ObsConfigs for opponents trained at a different
         # danger width than the agent (built lazily in _obs_config_for_bot).
         self._per_kdanger_obs_config: dict[int, ObsConfig] = {}
         self._prev_phi: float = 0.0  # E13: cut-readiness potential Φ(s) from the previous RL step
+        # S4: latency FIFO for the RL action path only (bots are never delayed
+        # — they model other players whose latency is implicit in their
+        # behavior). Rebuilt each reset from the RESOLVED per-episode config,
+        # so a randomized delay is constant within an episode.
+        self._action_delay = ActionDelayQueue(world_config.action_delay_ticks)
 
     def set_bot_difficulty(self, difficulty: float | None) -> None:
         """E11 curriculum hook: override bot difficulty for subsequent episodes.
@@ -121,9 +178,25 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         self._snake_cache.reset()
 
         for i in range(1 + self._num_bots):
-            # D6: opponents draw from the measured size distribution; snake 0 (the
-            # agent) always starts at initial_mass so the task stays comparable.
-            self._world.spawn_snake(i, sample_mass=(i != 0))
+            # Opponent starting size: P0.5 `bot_sct_law` wins when set (explicit
+            # mass); otherwise D6's world-level `spawn_mass_law` draws. Snake 0
+            # (the agent) always starts at initial_mass so the task stays
+            # comparable across every frozen eval.
+            self._world.spawn_snake(
+                i,
+                mass=self._bot_spawn_mass() if i > 0 else None,
+                sample_mass=(i != 0),
+            )
+
+        # S4: re-sample the per-episode delay (resolved config) and seed the
+        # FIFO with the RL snake's spawn heading / no boost, so the first
+        # `delay` ticks match an uncommanded snake exactly.
+        self._action_delay = ActionDelayQueue(self._world_config.action_delay_ticks)
+        spawn_angle = self._world.get_snake_states()[0].angle
+        self._action_delay.seed(spawn_angle)
+        # S5: last-commanded seeds with the spawn heading / no boost, exactly
+        # like the delay queue.
+        self._last_commanded_rl = v5_initial_last_action(spawn_angle)
 
         rl_obs = self._get_rl_observation()
         self._update_bot_obs_cache()
@@ -199,6 +272,9 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         else:
             cos_a, sin_a = 1.0, 0.0
         boost = bool(action[2] > 0.5)
+        # S5: record the COMMANDED (pre-delay-queue) action; the v5 obs feeds
+        # it back as self_state[7] and [9:12] next step (env_obs_v5 docstring).
+        self._last_commanded_rl = (cos_a, sin_a, 1.0 if boost else 0.0)
 
         bot_actions: dict[int, tuple[float, float, bool]] = {}
         # Group alive, obs-cached bots by their policy object so policies that support batched
@@ -230,7 +306,12 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         last_step_result = None
 
         for _ in range(config.step_mul):
-            world_actions: dict[int, tuple[float, float, bool]] = {0: (cos_a, sin_a, boost)}
+            # S4: per-tick FIFO — the action applied at tick t is the one
+            # commanded at t - delay. No-op (returns the tuple unchanged)
+            # when action_delay_ticks == 0, the legacy default.
+            world_actions: dict[int, tuple[float, float, bool]] = {
+                0: self._action_delay.apply((cos_a, sin_a, boost))
+            }
             world_actions.update(bot_actions)
 
             results = self._world.step(world_actions)
@@ -263,7 +344,12 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             for i in range(1, 1 + self._num_bots):
                 state = self._world.get_snake_states().get(i)
                 if state is None or not state.alive:
-                    self._world.spawn_snake(i, sample_mass=True)
+                    # P0.5: respawns re-draw from the same size law, keeping the
+                    # opponent size DISTRIBUTION stationary over the episode.
+                    # `sample_mass` is the D6 fallback when bot_sct_law is unset.
+                    self._world.spawn_snake(
+                        i, mass=self._bot_spawn_mass(), sample_mass=True
+                    )
                     # Reset stateful policies on respawn
                     if i in self._bot_policies and hasattr(self._bot_policies[i], 'reset'):
                         self._bot_policies[i].reset(i)
@@ -304,6 +390,12 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         if rl_state is None or not rl_state.alive:
             return self._empty_obs()
 
+        # S5: the deployable obs path (visibility mask + canonical build_obs).
+        if self._obs_schema == "v5":
+            return v5_observe(
+                self._world, 0, self._obs_config_v5, self._last_commanded_rl
+            )
+
         food_pos = self._world.get_food_positions()
         food_vals = self._world.get_food_values()
         raw = self._build_raw_state(0, rl_state, states, food_pos, food_vals)
@@ -316,20 +408,174 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         )
         return compute_observation(raw, self._obs_config, snake_slot_mapping=slot_mapping)
 
+    def _bot_spawn_mass(self) -> float | None:
+        """Sample a bot's spawn mass from the configured size law.
+
+        Returns None (spawn at initial_mass, zero RNG draws — legacy
+        byte-identity) unless bot_sct_law is set. "lognormal": sct is drawn
+        from lognormal(ln(median), sigma) and clipped to
+        [bot_sct_min, bot_sct_max]; the sim's segment cap
+        (max_segments_per_snake, 256) is the natural ceiling. Draws exactly
+        one value from self._rng per call, so pinned seeds stay deterministic.
+        """
+        if self._bot_sct_law is None:
+            return None
+        sct = float(
+            self._rng.lognormal(
+                mean=math.log(self._bot_sct_log_median), sigma=self._bot_sct_log_sigma
+            )
+        )
+        sct = min(max(sct, self._bot_sct_min), self._bot_sct_max)
+        cfg = self._world_config
+        if cfg.growth_law == "real":
+            # R3: the mass currency is the client's own (fpsls/fmlts law), so
+            # the sct->mass inverse is real_mass at the drawn continuous size.
+            return real_mass_continuous(sct)
+        # Inverse of snake.py: sct = initial_segments + (mass - initial_mass).
+        return cfg.initial_mass + (sct - cfg.initial_segments)
+
     def _update_bot_obs_cache(self) -> None:
         assert self._world is not None
         self._bot_obs_cache.clear()
+        self._bot_obs_partial.clear()
         states = self._world.get_snake_states()
-        food_pos = self._world.get_food_positions()
-        food_vals = self._world.get_food_values()
-        food_corpse = self._world.get_food_is_corpse()
+        # Full agent-grade obs are only needed by policy-driven bots
+        # (self-play / league). Scripted BotPolicy consumes exactly
+        # self_state[2:5], enemies[:, {0,1,26,28,29,31}] and food[:, 0:3]
+        # (see _compute_bot_observation_fast), so scripted bots get the fast
+        # partial build. Compacting the food arrays is O(max_food); skip it
+        # unless some bot actually takes the full path.
+        food_pos = food_vals = food_corpse = None
+        if any(i in self._bot_policies for i in range(1, 1 + self._num_bots)):
+            food_pos = self._world.get_food_positions()
+            food_vals = self._world.get_food_values()
+            food_corpse = self._world.get_food_is_corpse()
 
         for i in range(1, 1 + self._num_bots):
             bot_state = states.get(i)
             if bot_state is None or not bot_state.alive:
                 continue
-            raw = self._build_raw_state(i, bot_state, states, food_pos, food_vals, food_corpse)
-            self._bot_obs_cache[i] = compute_observation(raw, self._obs_config_for_bot(i))
+            if i in self._bot_policies:
+                raw = self._build_raw_state(
+                    i, bot_state, states, food_pos, food_vals, food_corpse
+                )
+                self._bot_obs_cache[i] = compute_observation(raw, self._obs_config_for_bot(i))
+            else:
+                self._bot_obs_cache[i] = self._compute_bot_observation_fast(
+                    i, bot_state, states
+                )
+                self._bot_obs_partial.add(i)
+
+    def _compute_bot_observation_fast(
+        self,
+        snake_id: int,
+        state: Any,
+        all_states: dict[int, Any],
+    ) -> dict[str, NDArray[np.float32]]:
+        """Scripted-BotPolicy observation (env-throughput batch, 2026-08-09).
+
+        BotPolicy.act consumes ONLY:
+          - self_state[2] (cos), [3] (sin), [4] (log mass)
+          - enemies[:, 0-1] (rel head), [26] (log mass), [28-29] (heading),
+            [31] (is_active) — via _find_nearest_enemy
+          - food[:, 0:3] (rel x/y, value; effectively the nearest rows)
+        This builds those fields BITWISE-identical to compute_observation
+        (same float32 expressions, same candidate ordering, same argsort
+        input) and leaves everything else zero: enemy body samples (cols
+        2-25), prey, danger_segments, own_body, minimap, and the
+        self_state[8:12] compass are never read by any scripted personality.
+        The physics goldens + test_bot_obs_fast.py pin this contract; if
+        BotPolicy ever grows a new input, extend this builder (the goldens
+        will catch a silent miss as a trajectory divergence).
+
+        Cost: O(nearby pellets + n_snakes) instead of O(max_food + total
+        segments + minimap area) per bot — the old path was 36% of env time
+        at 64 bots.
+        """
+        assert self._world is not None
+        oc = self._obs_config
+        perception_radius = 500.0  # obs_processor.compute_observation constant
+        initial_mass = 10.0
+        max_segments = 256
+
+        self_state = np.zeros(12, dtype=np.float32)
+        self_state[0] = state.head_x / self._world_config.map_radius
+        self_state[1] = state.head_y / self._world_config.map_radius
+        self_state[2] = math.cos(state.angle)
+        self_state[3] = math.sin(state.angle)
+        self_state[4] = math.log(state.mass / initial_mass)
+        self_state[5] = state.speed / oc.speed_norm
+        self_state[6] = state.segment_count / max_segments
+        self_state[7] = 1.0 if state.boosting else 0.0
+        # [8:12] nearest-food/prey compass: not consumed by BotPolicy — zeros.
+
+        # --- food (floor pellets), exact _compute_food replication on the
+        # grid-candidate subset (ascending global order == compacted order).
+        food_obs = np.zeros((oc.k_food, oc.food_features), dtype=np.float32)
+        fm = self._world._food
+        cand = fm.query_candidates(state.head_x, state.head_y, perception_radius)
+        if cand.size:
+            cand = cand[~fm._is_corpse[cand]]
+        if cand.size:
+            positions = fm._positions[cand]
+            values = fm._values[cand]
+            rel = positions - np.array(
+                [state.head_x, state.head_y], dtype=np.float32
+            )
+            dists = np.sqrt(np.sum(rel * rel, axis=1))
+            within = dists < perception_radius
+            if np.any(within):
+                rel_in = rel[within]
+                dists_in = dists[within]
+                vals_in = values[within]
+                order = np.argsort(dists_in)
+                n_take = min(len(order), oc.k_food)
+                order = order[:n_take]
+                food_obs[:n_take, 0] = rel_in[order, 0] / perception_radius
+                food_obs[:n_take, 1] = rel_in[order, 1] / perception_radius
+                food_obs[:n_take, 2] = vals_in[order]
+
+        # --- enemies, exact _compute_enemies replication minus body samples
+        # (cols 2-25 stay zero). Same cull, same stable distance sort.
+        enemy_obs = np.zeros((oc.k_enemies, oc.enemy_features), dtype=np.float32)
+        cull_sq = (self._world_config.perception_radius + 300) ** 2
+        nearby: list[Any] = []
+        for other_id, other in all_states.items():
+            if not other.alive or other_id == snake_id:
+                continue
+            if other.segment_count == 0:  # == len(get_segments(id)) == 0
+                continue
+            dx = other.head_x - state.head_x
+            dy = other.head_y - state.head_y
+            if dx * dx + dy * dy > cull_sq:
+                continue
+            nearby.append(other)
+        nearby.sort(
+            key=lambda s: math.hypot(s.head_x - state.head_x, s.head_y - state.head_y)
+        )
+        for slot in range(min(len(nearby), oc.k_enemies)):
+            s = nearby[slot]
+            row = enemy_obs[slot]
+            row[0] = (s.head_x - state.head_x) / perception_radius
+            row[1] = (s.head_y - state.head_y) / perception_radius
+            row[26] = math.log(max(s.mass, 1.0) / initial_mass)
+            row[27] = s.speed / oc.speed_norm
+            row[28] = math.cos(s.angle)
+            row[29] = math.sin(s.angle)
+            row[30] = 1.0 if s.boosting else 0.0
+            row[31] = 1.0
+
+        return {
+            "self_state": self_state,
+            "food": food_obs,
+            "prey": np.zeros((oc.k_prey, oc.prey_features), dtype=np.float32),
+            "enemies": enemy_obs,
+            "danger_segments": np.zeros(
+                (oc.k_danger_segments, oc.danger_features), dtype=np.float32
+            ),
+            "own_body": np.zeros((oc.k_own_body, oc.own_body_features), dtype=np.float32),
+            "minimap": np.zeros((oc.minimap_size, oc.minimap_size), dtype=np.float32),
+        }
 
     def _obs_config_for_bot(self, i: int) -> ObsConfig:
         """Per-snake obs (E29 refactor): a policy-opponent trained at a different danger width
@@ -448,10 +694,39 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         )
 
     def set_bot_policies(self, policies: dict[int, Any]) -> None:
-        """Swap bot policies at runtime. Called by training loop for self-play."""
+        """Swap bot policies at runtime. Called by training loop for self-play.
+
+        In every existing flow this runs BETWEEN episodes (train.py calls it
+        right before collect_episode -> env.reset rebuilds the obs cache).
+        Belt-and-braces for a mid-episode swap: any newly policy-driven bot
+        whose cached obs is the scripted PARTIAL build gets a full agent-grade
+        obs rebuilt from the current world, so a neural policy can never
+        consume a partial observation."""
         self._bot_policies = policies
+        stale = [
+            i for i in policies
+            if i in self._bot_obs_partial and i in self._bot_obs_cache
+        ]
+        if stale and self._world is not None:
+            states = self._world.get_snake_states()
+            food_pos = self._world.get_food_positions()
+            food_vals = self._world.get_food_values()
+            food_corpse = self._world.get_food_is_corpse()
+            for i in stale:
+                bot_state = states.get(i)
+                if bot_state is None or not bot_state.alive:
+                    continue
+                raw = self._build_raw_state(
+                    i, bot_state, states, food_pos, food_vals, food_corpse
+                )
+                self._bot_obs_cache[i] = compute_observation(
+                    raw, self._obs_config_for_bot(i)
+                )
+                self._bot_obs_partial.discard(i)
 
     def _empty_obs(self) -> dict[str, NDArray[np.float32]]:
+        if self._obs_schema == "v5":
+            return v5_empty_obs(self._obs_config_v5)
         obs_config = self._obs_config
         return {
             "self_state": np.zeros(8, dtype=np.float32),

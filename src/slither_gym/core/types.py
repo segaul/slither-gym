@@ -103,7 +103,12 @@ class WorldConfig:
     # pellets when deciding how many to top up. Counting corpse drops too (the legacy
     # path) lets corpses satisfy the target and shut off floor spawning entirely —
     # measured collapsing regular pellets 1737 -> 4 over 20k ticks (R1).
-    density_counts_floor_only: bool = False
+    #
+    # Defaults True: this only has any effect when food_density_per_1e6 is set, which
+    # is itself opt-in (default None = legacy absolute counts), so legacy runs are
+    # byte-identical either way. Kept as a field purely as an escape hatch for
+    # reproducing the pre-R1 density behaviour.
+    density_counts_floor_only: bool = True
 
     # ------------------------------------------------------------------
     # Sim-realism calibration (2026-08-08). Measured constants and their
@@ -165,6 +170,17 @@ class WorldConfig:
     body_radius_sct_offset: float = 2.0     # measured: sc = 1 + (sct - 2)/106
     body_radius_sct_divisor: float = 106.0  # measured: exact over sct 2-262
 
+    # --- A2b: boost acceleration ramp (P0.2 follow-on, measured on the F1 ruler) ---
+    # Real slither.io does NOT jump to boost speed instantly: measured on the
+    # 8-game captures, speed ramps ~linearly 181.5 -> ~380 u/s over ~12 client
+    # frames (~0.40 s, ~469 u/s^2), while RELEASE drops to base speed within one
+    # frame. The instant-onset model left every boost onset ~40 u AHEAD of the
+    # real snake (2s pos err p50 45 u on boost windows vs 6.8 u non-boost).
+    # None = legacy instant onset (byte-identical for E9-E30 / frozen evals).
+    # When set: per-tick cap on speed INCREASE (u/tick per tick); decreases stay
+    # instant. 469 u/s^2 at 40 Hz = 469/1600 = 0.2931 u/tick^2 (realism.py).
+    boost_ramp_up_per_tick: float | None = None
+
     # --- C4: food density as a scale-free quantity ---
     # Pellets per 1e6 u^2. None = legacy absolute counts (max_food//2 at reset,
     # then food_spawn_rate pellets every food_refresh_interval ticks). When set,
@@ -172,6 +188,83 @@ class WorldConfig:
     # food does not silently vanish or explode when map_radius is dialled.
     # Measured: ~62 per 1e6 u^2.
     food_density_per_1e6: float | None = None
+
+    # --- C3/P0.3: food value distribution law ---
+    # "legacy": one uniform(food_value_min, food_value_max) draw per pellet --
+    #   byte-identical RNG stream to the pre-P0.3 sim.
+    # "real": mixture matching the MEASURED distribution (min 3.0, p25 4.8,
+    #   p50 5.2, p75 6.2, tail to 14.2, mean 6.25):
+    #     prob (1 - food_tail_weight): lognormal(mu, sigma) clipped to
+    #       [3.0, food_tail_lo]  (the bulk cluster at ~5.2)
+    #     prob food_tail_weight: uniform(food_tail_lo, food_tail_hi)
+    #       (the high-value 10-14.2 tail)
+    #   Fit (realism.py FOOD_BULK_* note): mu=1.637, sigma=0.149, w=0.153 gives
+    #   quartiles 4.74/5.32/6.14 and mean 6.253. The numeric fields below are
+    #   inert unless food_value_law == "real".
+    food_value_law: str = "legacy"
+    food_bulk_log_mu: float = 1.637
+    food_bulk_log_sigma: float = 0.149
+    food_tail_lo: float = 10.0
+    food_tail_hi: float = 14.2
+    food_tail_weight: float = 0.153
+
+    # --- D1/P0.3: corpse value law ---
+    # "legacy": one pellet per segment worth
+    #   corpse_food_base + (corpse_food_scale - base) * sqrt(mass/max_mass)
+    #   ~= 2.0-2.2, so a corpse returns roughly the victim's own mass
+    #   (~20 pellets' worth). Byte-identical to pre-P0.3.
+    # "real": total corpse value = corpse_mass_multiplier * victim mass
+    #   (measured: a real corpse is worth ~400 pellets vs the sim's ~20, i.e.
+    #   ~20x the victim's mass), split evenly across segments, with
+    #   pellets-per-segment chosen so each pellet's value lands near
+    #   corpse_pellet_value_target -- the midpoint of the observed 10-14.2
+    #   high-value tail, which is what real corpse pellets are. Total value is
+    #   conserved exactly. Inert unless corpse_value_law == "real".
+    corpse_value_law: str = "legacy"
+    corpse_mass_multiplier: float = 20.0
+    corpse_pellet_value_target: float = 12.1
+
+    # --- R3: growth law (pellet value -> mass -> segments) ---
+    # "legacy": pellet value adds to mass 1:1 and
+    #   sct = initial_segments + int(mass - initial_mass), i.e. one mass unit
+    #   per segment. A mean measured pellet (value 6.25) therefore grants 6.25
+    #   SEGMENTS and the sct-256 physics cap is saturated ~23 s into a 200 s
+    #   episode — after which width/turn/segments are all capped (mass is
+    #   physically inert) while reward keeps paying mass_delta, a diagnosed
+    #   degenerate optimum (E32). Byte-identical default.
+    # "real": mass is tracked in the CLIENT'S OWN currency (the fpsls/fmlts
+    #   LUT quantity, docs/REAL_GAME_DATA.md "length"; core/growth.py), and
+    #   (sct, fam) derive from mass through the exact LUT inverse. The law is
+    #   superlinear — a segment costs >= 16.5 mass at the relevant sizes while
+    #   a mean pellet is worth ~1.3 mass — so segment growth runs ~79x slower
+    #   than legacy at measured pellet values and the sct-256 cap is reached
+    #   on the real timescale (~80 min of pure foraging at measured density,
+    #   not 23 s). Reward stays mass_delta on this real, continuous scale.
+    #   Derivation: docs/experiments/data/growth_law_r3.py (slither-rl).
+    growth_law: str = "legacy"
+    # Mass gained per unit of pellet VALUE, read only under growth_law="real"
+    # (legacy is hard-wired 1:1). = measured growth per pellet (~1.3 mass
+    # units, docs/REAL_GAME_DATA.md sec. 4) / measured mean pellet value
+    # (6.25, the C3 mixture mean) = 0.208. A RATIO OF TWO MEASUREMENTS, not a
+    # client constant — genuinely uncertain, so it carries a DR band below.
+    # The LUT law itself is exact (bitwise-verified) and is NOT randomized.
+    pellet_mass_per_value: float = 0.208
+    pellet_mass_per_value_min: float | None = None
+    pellet_mass_per_value_max: float | None = None
+
+    # --- S4: action latency (V5 plan, E5) ---
+    # The real control loop is a ~30 Hz client plus network RTT; the sim
+    # applies an RL action to the very next physics tick with zero latency.
+    # action_delay_ticks delays the EXTERNALLY-COMMANDED (RL) action path by
+    # this many physics ticks: the action applied at tick t is the one
+    # commanded at tick t - delay, through a per-snake FIFO seeded with the
+    # spawn heading / no-boost. Enforced at the ENV layer (env_gym /
+    # env_parallel), not in World -- World cannot tell RL snakes from bots,
+    # and bots model other players whose latency is already implicit in
+    # their behavior, so they are never delayed.
+    # 0 = legacy zero-latency, byte-identical to every pre-S4 run.
+    # Scale: 0-2 client frames at 30 Hz ~= 0-66 ms ~= 0-3 sim ticks at 40 Hz.
+    action_delay_ticks: int = 0
 
     # --- Domain randomization over UNMEASURED / UNCONFIRMED physics ---
     # Master gate. False => sample_world_config() is a no-op and draws no RNG,
@@ -206,6 +299,21 @@ class WorldConfig:
     # point estimate.
     boost_mass_cost_per_tick_min: float | None = None
     boost_mass_cost_per_tick_max: float | None = None
+    # corpse_mass_multiplier: INFERRED from growth attribution (79% corpse
+    # share, +520 length in one gorge), never counted from logged kill events.
+    # Uncertainty is real and large -- the preset bands it +/-50% (10..30).
+    corpse_mass_multiplier_min: float | None = None
+    corpse_mass_multiplier_max: float | None = None
+    # food_tail_weight: solved from the mean constraint (mean 6.25), not
+    # counted directly. Preset band 0.10..0.20 (mixture mean ~5.9..~6.6).
+    food_tail_weight_min: float | None = None
+    food_tail_weight_max: float | None = None
+    # action_delay_ticks: real RTT is UNMEASURED until the first live bridge
+    # session (V5 plan S4/S7); the band covers 0-2 client frames at 30 Hz.
+    # INTEGER range, sampled INCLUSIVE on both ends -- (0, 3) draws from
+    # {0, 1, 2, 3} sim ticks, per-episode, constant within an episode.
+    action_delay_ticks_min: int | None = None
+    action_delay_ticks_max: int | None = None
 
 
 @dataclass
