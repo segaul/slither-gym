@@ -162,6 +162,18 @@ class ObsConfigV5:
     #              same [0, 1] range, same slot, same obs shape -- so nothing
     #              downstream changes -- but the value depends only on how far
     #              the wall actually is. Opt-in, for FUTURE training runs.
+    #
+    # KNOWN TRADEOFF of "fixed", recorded rather than discovered later: it
+    # DISCARDS absolute-position information. Legacy's r/R was a continuous
+    # "how central am I" signal over the whole map; "fixed" reads 0 everywhere
+    # further than boundary_norm from the border, so a policy can no longer
+    # tell the centre from the mid-field. Deliberate: under a uniform food and
+    # opponent density there is nothing to learn from "how central", the
+    # bearing-to-centre unit vector (self_state[1:3]) still gives the
+    # DIRECTION home, and centrality is exactly the piece that was
+    # scale-dependent. Whether that trade is net-positive for TRAINING is an
+    # open question that only a training run can answer; it is pre-registered
+    # separately before any GPU is spent.
     boundary_mode: str = "legacy"
     # Normalizer for boundary_mode "fixed", in world units. Pinned to the same
     # 2500 u as `enemy_window` -- the largest fixed physical window in the
