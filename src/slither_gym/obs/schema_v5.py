@@ -135,9 +135,17 @@ class ObsConfigV5:
     enemy_body_max_pts: int = 96
     # Food value measured min 3.0 / median 5.2 / max 14.2 -> /15 stays <1.
     value_norm: float = 15.0
-    # Measured real map radius (border hit at r=14976.5). Used by the BRIDGE
-    # to fill VisibleState.map_radius; under boundary_mode "legacy" build_obs
-    # normalizes r by VisibleState.map_radius.
+    # DEAD FIELD -- read by NOTHING. Kept only because it is named in every
+    # resolved_config.yaml this project has ever written, so deleting it would
+    # silently change the provenance artefact's shape; delete it deliberately,
+    # in its own commit, or not at all.
+    #
+    # It reads like the boundary normalizer and is not: `build_obs` never
+    # touches it (see boundary_mode below), and the bridge fills
+    # VisibleState.map_radius from `obs_translator_v5.REAL_MAP_RADIUS`, an
+    # unrelated constant that happens to hold the same 15000.0. The 2026-W36
+    # captain's log records this field misleading a reader mid-diagnosis.
+    # Measured value: real border hit at r = 14976.5.
     map_radius_norm: float = 15000.0
 
     # --- boundary encoding (T8) -------------------------------------------
