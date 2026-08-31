@@ -136,10 +136,52 @@ class ObsConfigV5:
     # Food value measured min 3.0 / median 5.2 / max 14.2 -> /15 stays <1.
     value_norm: float = 15.0
     # Measured real map radius (border hit at r=14976.5). Used by the BRIDGE
-    # to fill VisibleState.map_radius; build_obs normalizes r by
-    # VisibleState.map_radius so the boundary scalar is scale-free in both
-    # worlds (world scale is a knob, not a constant).
+    # to fill VisibleState.map_radius; under boundary_mode "legacy" build_obs
+    # normalizes r by VisibleState.map_radius.
     map_radius_norm: float = 15000.0
+
+    # --- boundary encoding (T8) -------------------------------------------
+    # The legacy boundary scalar is `r / VisibleState.map_radius`, and the
+    # comment that used to sit here called that "scale-free". It is not, and
+    # the claim cost a whole experiment: `map_radius` is the LIVE env radius,
+    # so the SAME local geometry produces a DIFFERENT number in a differently
+    # sized world, and the feature's rate of change per unit moved scales as
+    # 1/map_radius. A policy that learned "start turning when this reaches
+    # 0.9" therefore turns at a different ABSOLUTE distance from the wall in
+    # every world. `docs/experiments/results/T5/SCALE_RESCORE.md` measured a
+    # density-training gain that was clean at r=7500 (Delta >=120s +0.150,
+    # HR 0.596) and exactly null at r=15000, and named this line as the
+    # confound.
+    #
+    # "legacy"  -> r / map_radius_effective   (BYTE-IDENTICAL default; every
+    #              existing checkpoint, frozen eval and golden is unchanged)
+    # "fixed"   -> clip(1 - (map_radius_effective - r) / boundary_norm, 0, 1)
+    #              An absolute distance-to-border normalized by a FIXED
+    #              physical constant, the way every other V5 channel encodes
+    #              space. Same polarity (0 = far from wall, 1 = at the wall),
+    #              same [0, 1] range, same slot, same obs shape -- so nothing
+    #              downstream changes -- but the value depends only on how far
+    #              the wall actually is. Opt-in, for FUTURE training runs.
+    boundary_mode: str = "legacy"
+    # Normalizer for boundary_mode "fixed", in world units. Pinned to the same
+    # 2500 u as `enemy_window` -- the largest fixed physical window in the
+    # schema (probe-cited enemy delivery range) and ~13.8 s of travel at the
+    # measured base speed 181.5 u/s, i.e. a real decision horizon for a turn.
+    # Deliberately a SEPARATE field, not a reuse of enemy_window, so it can be
+    # tuned without moving the enemy window. Beyond boundary_norm from the
+    # border the feature saturates at 0, which is correct: at 3 km from the
+    # wall the wall is not a fact about your next action (T4's death taxonomy
+    # recorded 0/39 real deaths from walls).
+    boundary_norm: float = 2500.0
+    # DIAGNOSTIC ONLY (T8 Phase 1). When not None, build_obs uses this value
+    # in place of VisibleState.map_radius when computing the boundary feature
+    # -- and NOTHING else: not the world, not spawn, not the border test, not
+    # reward. It exists to feed a policy the boundary feature it was TRAINED
+    # on while it plays a differently-sized world, which isolates the obs
+    # artefact from the environment's difficulty. Default None reproduces the
+    # previous behavior exactly. It is not a training knob and it makes any
+    # eval that sets it a diagnostic, not a ruler.
+    obs_map_radius_override: float | None = None
     # Measured base speed 181.5 u/s (8-game value) -> sp/sp_base reads 1.0 at
     # base and ~2.055 while boosting.
     sp_base: float = 181.5
@@ -206,6 +248,36 @@ def _arc_resample(
     return out, valid
 
 
+def _boundary_feature(
+    r: float, vs: "VisibleState", cfg: ObsConfigV5
+) -> float:
+    """The self_state[0] boundary scalar (T8).
+
+    `r` is the head's distance from the map centre. The ONE place in the V5
+    obs path that reads a map radius at all -- every other normalizer in
+    `build_obs` is a fixed physical constant (see the ObsConfigV5 field
+    comments), so this function is the complete scale-dependence of the
+    schema.
+
+    Default (`boundary_mode="legacy"`, `obs_map_radius_override=None`) is
+    exactly the historical expression `r / vs.map_radius`.
+    """
+    radius = (
+        vs.map_radius
+        if cfg.obs_map_radius_override is None
+        else cfg.obs_map_radius_override
+    )
+    if cfg.boundary_mode == "legacy":
+        return r / radius
+    if cfg.boundary_mode == "fixed":
+        d_border = radius - r
+        return min(max(1.0 - d_border / cfg.boundary_norm, 0.0), 1.0)
+    raise ValueError(
+        f"unknown boundary_mode {cfg.boundary_mode!r} "
+        "(expected 'legacy' or 'fixed')"
+    )
+
+
 def _nearest_first(
     rel: NDArray[np.float64], window: float, k: int
 ) -> NDArray[np.intp]:
@@ -247,7 +319,7 @@ def build_obs(
         cos_to_center, sin_to_center = 0.0, 0.0
     mass = real_mass(vs.sct, vs.fam)
     self_state = np.array([
-        r / vs.map_radius,
+        _boundary_feature(r, vs, cfg),
         cos_to_center,
         sin_to_center,
         math.cos(vs.angle),

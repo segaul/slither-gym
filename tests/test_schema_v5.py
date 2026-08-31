@@ -579,3 +579,117 @@ def test_visibility_keeps_far_head_near_body_snake() -> None:
     world._segments[start:start + n_pts] = far_pts
     vs2 = visible_state_from_world(world, 0, cfg)
     assert vs2.enemies == ()
+
+
+# ---------------------------------------------------------------------------
+# T8 — boundary encoding (docs/experiments/PROPOSAL-T8-scale-invariant-boundary.md)
+# ---------------------------------------------------------------------------
+
+
+def test_t8_defaults_are_the_legacy_expression() -> None:
+    """Default ObsConfigV5 reproduces `r / vs.map_radius` exactly.
+
+    The byte-identity guarantee every existing checkpoint, frozen eval and
+    golden fingerprint rests on.
+    """
+    cfg = ObsConfigV5()
+    assert cfg.boundary_mode == "legacy"
+    assert cfg.obs_map_radius_override is None
+    vs = _simple_state()
+    r = math.hypot(vs.head_x - vs.map_center_x, vs.head_y - vs.map_center_y)
+    obs = build_obs(vs, cfg)
+    assert obs["self_state"][0] == np.float32(r / vs.map_radius)
+
+
+def test_t8_legacy_boundary_is_NOT_scale_invariant() -> None:
+    """The defect T8 exists to fix, pinned as a test so it cannot be re-broken.
+
+    Identical local geometry (head 400 u from the border) in two differently
+    sized worlds must produce DIFFERENT legacy numbers.
+    """
+    cfg = ObsConfigV5()
+    small = _simple_state(head_x=7100.0, head_y=0.0, map_radius=7500.0)
+    big = _simple_state(head_x=14600.0, head_y=0.0, map_radius=15000.0)
+    a = float(build_obs(small, cfg)["self_state"][0])
+    b = float(build_obs(big, cfg)["self_state"][0])
+    assert not math.isclose(a, b, rel_tol=1e-6)
+    # and the direction is the confound: the big world reads FARTHER from the
+    # wall while standing the same 400 u away from it.
+    assert b > a
+
+
+def test_t8_fixed_boundary_IS_scale_invariant() -> None:
+    """`boundary_mode="fixed"` reads the same number for the same real gap."""
+    cfg = ObsConfigV5(boundary_mode="fixed")
+    for gap in (0.0, 250.0, 400.0, 1250.0, 2499.0):
+        small = _simple_state(head_x=7500.0 - gap, head_y=0.0, map_radius=7500.0)
+        big = _simple_state(head_x=15000.0 - gap, head_y=0.0, map_radius=15000.0)
+        a = float(build_obs(small, cfg)["self_state"][0])
+        b = float(build_obs(big, cfg)["self_state"][0])
+        assert a == pytest.approx(b, abs=1e-6), gap
+        assert a == pytest.approx(1.0 - gap / cfg.boundary_norm, abs=1e-6)
+
+
+def test_t8_fixed_boundary_polarity_range_and_saturation() -> None:
+    """Same polarity and range as legacy (0 far, 1 at the wall), saturating."""
+    cfg = ObsConfigV5(boundary_mode="fixed")
+    at_wall = _simple_state(head_x=15000.0, head_y=0.0, map_radius=15000.0)
+    assert float(build_obs(at_wall, cfg)["self_state"][0]) == pytest.approx(1.0)
+    # Past the border (possible mid-tick / on the bridge) still clips at 1.0.
+    outside = _simple_state(head_x=15500.0, head_y=0.0, map_radius=15000.0)
+    assert float(build_obs(outside, cfg)["self_state"][0]) == 1.0
+    # Beyond boundary_norm from the border it saturates at 0, not negative.
+    centre = _simple_state(head_x=0.0, head_y=0.0, map_radius=15000.0)
+    assert float(build_obs(centre, cfg)["self_state"][0]) == 0.0
+    deep = _simple_state(head_x=12499.0, head_y=0.0, map_radius=15000.0)
+    assert float(build_obs(deep, cfg)["self_state"][0]) == 0.0
+
+
+def test_t8_fixed_boundary_changes_only_self_state_0() -> None:
+    """Switching modes must not perturb any other element of the obs."""
+    vs = _simple_state(head_x=14600.0, head_y=0.0, map_radius=15000.0)
+    legacy = build_obs(vs, ObsConfigV5())
+    fixed = build_obs(vs, ObsConfigV5(boundary_mode="fixed"))
+    assert float(legacy["self_state"][0]) != float(fixed["self_state"][0])
+    assert legacy["self_state"][1:].tobytes() == fixed["self_state"][1:].tobytes()
+    for key in ("food", "enemies", "danger_segments", "own_body"):
+        assert legacy[key].tobytes() == fixed[key].tobytes(), key
+
+
+def test_t8_override_pins_the_denominator_and_nothing_else() -> None:
+    """The Phase-1 diagnostic knob: same world, training-scale denominator."""
+    vs = _simple_state(head_x=6000.0, head_y=0.0, map_radius=15000.0)
+    base = build_obs(vs, ObsConfigV5())
+    pinned = build_obs(vs, ObsConfigV5(obs_map_radius_override=7500.0))
+    assert float(base["self_state"][0]) == pytest.approx(6000.0 / 15000.0)
+    assert float(pinned["self_state"][0]) == pytest.approx(6000.0 / 7500.0)
+    assert base["self_state"][1:].tobytes() == pinned["self_state"][1:].tobytes()
+    for key in ("food", "enemies", "danger_segments", "own_body"):
+        assert base[key].tobytes() == pinned[key].tobytes(), key
+    # A pinned obs at r=15000 equals the obs the SAME head position would have
+    # produced in the r=7500 world it was trained in -- that identity is the
+    # whole point of the diagnostic.
+    trained = build_obs(_simple_state(head_x=6000.0, head_y=0.0, map_radius=7500.0),
+                        ObsConfigV5())
+    assert float(pinned["self_state"][0]) == float(trained["self_state"][0])
+
+
+def test_t8_override_applies_under_fixed_mode_too() -> None:
+    vs = _simple_state(head_x=6000.0, head_y=0.0, map_radius=15000.0)
+    cfg = ObsConfigV5(boundary_mode="fixed", obs_map_radius_override=7500.0)
+    # d_border measured against the PINNED radius: 7500 - 6000 = 1500.
+    assert float(build_obs(vs, cfg)["self_state"][0]) == pytest.approx(
+        1.0 - 1500.0 / 2500.0
+    )
+
+
+def test_t8_unknown_boundary_mode_raises() -> None:
+    """Fail loudly: a typo must not silently fall back to legacy."""
+    with pytest.raises(ValueError, match="unknown boundary_mode"):
+        build_obs(_simple_state(), ObsConfigV5(boundary_mode="scale_free"))
+
+
+def test_t8_boundary_norm_is_the_enemy_window_value() -> None:
+    """Pinned to 2500 u, the schema's largest fixed physical window."""
+    cfg = ObsConfigV5()
+    assert cfg.boundary_norm == 2500.0 == cfg.enemy_window
