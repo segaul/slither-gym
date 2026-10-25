@@ -36,9 +36,14 @@ def compute_reward(
     if not result.alive:
         reward += config.death_penalty
 
-    dist_from_center = math.sqrt(snake_state.head_x ** 2 + snake_state.head_y ** 2)
-    edge_ratio = dist_from_center / config.map_radius
-    if edge_ratio > 0.8:
-        reward -= 0.1 * ((edge_ratio - 0.8) / 0.2)
+    # T11: under edge_shaping "potential" this per-tick state cost is GONE — it is a
+    # non-potential term that scales with map_radius and made "die now" cheaper than
+    # escaping the band (border_pathology.md); its replacement lives at the RL-step
+    # boundary in env_gym (γ·Φ(s′) − Φ(s)).
+    if config.edge_shaping == "legacy":
+        dist_from_center = math.sqrt(snake_state.head_x ** 2 + snake_state.head_y ** 2)
+        edge_ratio = dist_from_center / config.map_radius
+        if edge_ratio > 0.8:
+            reward -= 0.1 * ((edge_ratio - 0.8) / 0.2)
 
     return reward

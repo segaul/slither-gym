@@ -132,6 +132,13 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         # danger width than the agent (built lazily in _obs_config_for_bot).
         self._per_kdanger_obs_config: dict[int, ObsConfig] = {}
         self._prev_phi: float = 0.0  # E13: cut-readiness potential Φ(s) from the previous RL step
+        # T11: border potential Φ(s) ≤ 0 from the previous RL step (edge_shaping "potential").
+        if world_config.edge_shaping not in ("legacy", "potential"):
+            raise ValueError(
+                f"unknown edge_shaping {world_config.edge_shaping!r} "
+                "(expected 'legacy' or 'potential')"
+            )
+        self._prev_edge_phi: float = 0.0
         # S4: latency FIFO for the RL action path only (bots are never delayed
         # — they model other players whose latency is implicit in their
         # behavior). Rebuilt each reset from the RESOLVED per-episode config,
@@ -204,7 +211,33 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         self._prev_phi = (
             self._compute_cut_potential() if self._world_config.kill_shaping_coef != 0.0 else 0.0
         )
+        # T11: seed Φ(s_0) for the border potential the same way.
+        self._prev_edge_phi = (
+            self._compute_edge_potential()
+            if self._world_config.edge_shaping == "potential"
+            else 0.0
+        )
         return rl_obs, {}
+
+    def _compute_edge_potential(self) -> float:
+        """T11 border potential Φ(s) ∈ [−k, 0] — STATE-ONLY, a function of physical
+        border distance alone (scale-invariant; shares the obs' 2500 u length scale).
+
+        Φ = −edge_shaping_coef · clip(1 − d_border/edge_shaping_width, 0, 1): 0 further than
+        edge_shaping_width from the border, −edge_shaping_coef at the wall.
+        """
+        world = self._world
+        if world is None:
+            return 0.0
+        state = world.get_snake_states().get(0)
+        if state is None or not state.alive:
+            return 0.0
+        cfg = self._world_config
+        r = math.sqrt(state.head_x ** 2 + state.head_y ** 2)
+        d_border = cfg.map_radius - r
+        return -cfg.edge_shaping_coef * min(
+            max(1.0 - d_border / cfg.edge_shaping_width, 0.0), 1.0
+        )
 
     def _compute_cut_potential(self) -> float:
         """E13 cut-readiness potential Φ(s) ∈ [0, 1] — STATE-ONLY (no actions/time/history).
@@ -339,6 +372,15 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
                 config.kill_shaping_gamma * phi_next - self._prev_phi
             )
             self._prev_phi = phi_next
+
+        # T11: potential-based border shaping, ONCE per RL step, replacing the legacy per-tick
+        # edge cost (gated off in compute_reward under this mode). Φ(terminal) = 0; at
+        # TRUNCATION Φ(s′) is the real state potential, NOT zeroed (the trainer bootstraps
+        # V(s_T) there — truncation-termination-check).
+        if config.edge_shaping == "potential":
+            edge_phi_next = 0.0 if terminated else self._compute_edge_potential()
+            total_reward += config.edge_shaping_gamma * edge_phi_next - self._prev_edge_phi
+            self._prev_edge_phi = edge_phi_next
 
         if self._respawn_bots:
             for i in range(1, 1 + self._num_bots):

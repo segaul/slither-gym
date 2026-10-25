@@ -67,6 +67,18 @@ class WorldConfig:
     # E24: reward per confirmed kill. Default 5.0 = byte-identical to E9–E23 (the +5 kill term).
     # Raising it strengthens the incentive to hunt (test: does more kill-reward → higher kill-rate).
     kill_reward_coef: float = 5.0
+    # T11: border reward mode. "legacy" (default, byte-identical to every prior run) keeps the
+    # per-tick state cost −0.1·((r/R − 0.8)/0.2) in compute_reward — a NON-potential term whose
+    # band width and escape cost scale with map_radius. "potential" removes that cost and instead
+    # adds, ONCE per RL step (env_gym, same placement as E13's kill shaping):
+    #   r_shape = γ·Φ(s′) − Φ(s),  Φ(s) = −edge_shaping_coef·clip(1 − d_border/edge_shaping_width, 0, 1)
+    # with Φ(terminal)=0 and Φ at TRUNCATION kept (bootstrap V(s_T) — Pardo rule). Policy-invariant
+    # (Ng/Harada/Russell 1999) and scale-invariant: a function of physical d_border only, pinned to
+    # the same 2500 u as ObsConfigV5.boundary_norm so obs and reward share one border length scale.
+    edge_shaping: str = "legacy"
+    edge_shaping_width: float = 2500.0  # u; = ObsConfigV5.boundary_norm (T8)
+    edge_shaping_coef: float = 2.0  # k in Φ = −k·clip(...); credit hint, not a tuning knob
+    edge_shaping_gamma: float = 0.997  # must equal the trainer's RL γ (V4Config.gamma)
 
     # --- Corpse/floor food accounting. Both default to the LEGACY behaviour so
     # E9-E30 and frozen_eval_v1..v7 stay byte-identical. ---
