@@ -79,6 +79,17 @@ class WorldConfig:
     edge_shaping_width: float = 2500.0  # u; = ObsConfigV5.boundary_norm (T8)
     edge_shaping_coef: float = 2.0  # k in Φ = −k·clip(...); credit hint, not a tuning knob
     edge_shaping_gamma: float = 0.997  # must equal the trainer's RL γ (V4Config.gamma)
+    # T16 (DRAFT): potential-based OBSTRUCTION shaping — the same γΦ(s′)−Φ(s) pattern as
+    # edge_shaping, with Φ = −coef·clip(1 − d/width, 0, 1) on the distance from MY HEAD to
+    # the NEAREST ENEMY BODY SEGMENT (what kills on contact; the E33 death breakdown is 79%
+    # head-on into established bodies). "off" (default) is byte-identical to every prior
+    # run; width defaults to the danger_window (800 u) so the potential never prices
+    # anything the policy cannot see. γ must equal the trainer's γ. Φ(terminal)=0; Φ kept
+    # at truncation (Pardo), exactly as edge_shaping.
+    body_shaping: str = "off"
+    body_shaping_width: float = 800.0  # u; = ObsConfig danger_window (perception-matched)
+    body_shaping_coef: float = 2.0
+    body_shaping_gamma: float = 0.997  # must equal the trainer's RL γ
 
     # --- Corpse/floor food accounting. Both default to the LEGACY behaviour so
     # E9-E30 and frozen_eval_v1..v7 stay byte-identical. ---

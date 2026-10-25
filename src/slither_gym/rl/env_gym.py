@@ -139,6 +139,13 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
                 "(expected 'legacy' or 'potential')"
             )
         self._prev_edge_phi: float = 0.0
+        # T16 (DRAFT): obstruction potential Φ(s) ≤ 0 from the previous RL step.
+        if world_config.body_shaping not in ("off", "potential"):
+            raise ValueError(
+                f"unknown body_shaping {world_config.body_shaping!r} "
+                "(expected 'off' or 'potential')"
+            )
+        self._prev_body_phi: float = 0.0
         # S4: latency FIFO for the RL action path only (bots are never delayed
         # — they model other players whose latency is implicit in their
         # behavior). Rebuilt each reset from the RESOLVED per-episode config,
@@ -217,7 +224,36 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             if self._world_config.edge_shaping == "potential"
             else 0.0
         )
+        # T16: seed the obstruction potential the same way.
+        self._prev_body_phi = (
+            self._compute_body_potential()
+            if self._world_config.body_shaping == "potential"
+            else 0.0
+        )
         return rl_obs, {}
+
+    def _compute_body_potential(self) -> float:
+        """T16 obstruction potential Φ(s) ∈ [−k, 0] — STATE-ONLY: distance from MY head to
+        the nearest ALIVE ENEMY body segment, clipped to body_shaping_width (default = the
+        danger_window, so the potential prices nothing the policy can't perceive)."""
+        world = self._world
+        if world is None:
+            return 0.0
+        me = world.get_snake_states().get(0)
+        if me is None or not me.alive:
+            return 0.0
+        owner = world._seg_owner
+        alive = world._seg_alive
+        theirs = (owner != 0) & (owner >= 0) & alive
+        if not theirs.any():
+            return 0.0
+        segs = world._segments[theirs]
+        d = segs - np.array([me.head_x, me.head_y], dtype=segs.dtype)
+        nearest = float(np.sqrt(np.min(d[:, 0] ** 2 + d[:, 1] ** 2)))
+        cfg = self._world_config
+        return -cfg.body_shaping_coef * min(
+            max(1.0 - nearest / cfg.body_shaping_width, 0.0), 1.0
+        )
 
     def _compute_edge_potential(self) -> float:
         """T11 border potential Φ(s) ∈ [−k, 0] — STATE-ONLY, a function of physical
@@ -381,6 +417,12 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             edge_phi_next = 0.0 if terminated else self._compute_edge_potential()
             total_reward += config.edge_shaping_gamma * edge_phi_next - self._prev_edge_phi
             self._prev_edge_phi = edge_phi_next
+
+        # T16 (DRAFT): obstruction shaping, same placement and rules as the border term.
+        if config.body_shaping == "potential":
+            body_phi_next = 0.0 if terminated else self._compute_body_potential()
+            total_reward += config.body_shaping_gamma * body_phi_next - self._prev_body_phi
+            self._prev_body_phi = body_phi_next
 
         if self._respawn_bots:
             for i in range(1, 1 + self._num_bots):
