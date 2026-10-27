@@ -11,6 +11,9 @@ dependencies = [
     "numpy",
     "gymnasium",
     "pettingzoo",
+    # T19: the follow-chain physics kernel (bitwise-gated; snake.py falls back to the
+    # python reference without it, at ~2x the rollout cost)
+    "numba",
 ]
 
 [dependency-groups]
