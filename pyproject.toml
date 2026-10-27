@@ -19,6 +19,9 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest",
+    # 2026-10-27: two 0%-CPU pytest hangs in one night (mp deadlock under load) — every
+    # gate/CI pytest run carries a hard timeout so a hung test can never block a verdict.
+    "pytest-timeout",
     "mypy",
     "pygame",
 ]
