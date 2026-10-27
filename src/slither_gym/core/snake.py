@@ -1,10 +1,58 @@
 import math
+import os
 
 import numpy as np
 from numpy.typing import NDArray
 
 from slither_gym.core.growth import sct_fam_from_mass
 from slither_gym.core.types import SnakeState, WorldConfig
+
+
+def _follow_chain_py(seg: NDArray[np.float32], n: int, spacing: float) -> None:
+    """Reference follow-the-leader chain update over seg[0:n] (row 0 = head, already
+    moved). The precision contract every kernel must match BITWISE: dx/dy and dx*dx+dy*dy
+    in float32; sqrt of that (losslessly widened) in float64; the pulled coordinate
+    computed in float64 (float32 operands widened exactly) and rounded ONCE on store."""
+    for i in range(1, n):
+        dx = seg[i, 0] - seg[i - 1, 0]
+        dy = seg[i, 1] - seg[i - 1, 1]
+        d = math.sqrt(dx * dx + dy * dy)
+        if d > spacing:
+            seg[i, 0] = seg[i - 1, 0] + dx / d * spacing
+            seg[i, 1] = seg[i - 1, 1] + dy / d * spacing
+
+
+# T19 (PROPOSAL-T19-env-step-kernel): the same chain as a numba kernel. move() is ~60% of
+# world.step at training geometry, mostly THIS loop's per-element ndarray indexing. The
+# kernel replays the reference's mixed-precision op order exactly (asserted bitwise over
+# 10k random updates by tests/test_follow_chain_kernel.py and by the physics goldens).
+# Fallback order: numba missing or SLITHER_PHYSICS_KERNEL=python -> reference loop.
+PHYSICS_KERNEL = "python"
+_follow_chain = _follow_chain_py
+if os.environ.get("SLITHER_PHYSICS_KERNEL", "numba") != "python":
+    try:
+        from numba import njit
+
+        @njit("void(float32[:, ::1], int64, float64)", cache=True, fastmath=False)
+        def _follow_chain_numba(seg, n, spacing):  # pragma: no cover - mirrored by tests
+            # Mirrors the reference under numpy 2.x NEP-50 weak promotion: the compare is
+            # float64 (math.sqrt returns a python float), but dx/d*spacing stays FLOAT32
+            # (python-float operands are cast down to the float32 operand's dtype).
+            sp32 = np.float32(spacing)
+            for i in range(1, n):
+                dx = seg[i, 0] - seg[i - 1, 0]                  # float32
+                dy = seg[i, 1] - seg[i - 1, 1]                  # float32
+                t = dx * dx + dy * dy                           # float32
+                d = math.sqrt(np.float64(t))                    # float64 sqrt, exact widen
+                if d > spacing:
+                    d32 = np.float32(d)
+                    seg[i, 0] = seg[i - 1, 0] + dx / d32 * sp32
+                    seg[i, 1] = seg[i - 1, 1] + dy / d32 * sp32
+
+        PHYSICS_KERNEL = "numba-follow-chain-v1"
+        _follow_chain = _follow_chain_numba
+    except ImportError:
+        pass
 
 
 def _expected_segments(mass: float, config: WorldConfig) -> int:
@@ -218,14 +266,7 @@ class SnakeManager:
         # pull it to exactly spacing distance. If closer, leave it.
         # This is the standard "follow the leader" chain model.
         if seg_count > 1:
-            seg = segments[start:end]
-            for i in range(1, seg_count):
-                dx = seg[i, 0] - seg[i - 1, 0]
-                dy = seg[i, 1] - seg[i - 1, 1]
-                d = math.sqrt(dx * dx + dy * dy)
-                if d > spacing:
-                    seg[i, 0] = seg[i - 1, 0] + dx / d * spacing
-                    seg[i, 1] = seg[i - 1, 1] + dy / d * spacing
+            _follow_chain(segments[start:end], seg_count, spacing)
 
         # Growth: increase segment count. New segment duplicates tail.
         # On the next tick, the head moves forward and the chain pulls —
