@@ -18,8 +18,14 @@ from slither_gym.obs.schema_v5 import (
 from slither_gym.obs.visibility import visible_state_from_world
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "probe_v2_snapshot.json")
+# 2026-10-27: moved OUT of ~/Downloads — macOS TCC blocks Downloads reads for
+# background processes, and open() then hangs FOREVER at 0% CPU (two suite hangs in one
+# night; skipif's exists() passes but the read blocks). The artifacts store is TCC-safe.
+# To re-enable: copy the capture from ~/Downloads to the path below (needs a TCC-granted
+# shell, i.e. Evan's terminal).
 FULL_CAPTURE = os.path.expanduser(
-    "~/Downloads/slither_probe_v2_2026-08-09T03-22-10_game01.json"
+    "~/workspace/slither-rl-artifacts/probe_captures/"
+    "slither_probe_v2_2026-08-09T03-22-10_game01.json"
 )
 
 # Client sp -> u/s: measured base sp 5.78 corresponds to 181.5 u/s.
