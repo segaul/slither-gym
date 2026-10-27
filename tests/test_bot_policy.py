@@ -101,10 +101,13 @@ def test_random_walk() -> None:
     rng = np.random.default_rng(42)
     bot = BotPolicy(config, rng)
 
-    # No food, no enemies
+    # _wander steers toward the bot's own _wander_angle (random at init), NOT the
+    # snake's current heading — the old assertion ("near current heading") only held
+    # by seed luck and broke when E12 changed the init rng consumption. Pin the
+    # wander angle and assert the mechanics around IT.
+    bot._wander_angle = 0.5
     obs = _make_obs(heading_angle=0.5)
     action = bot.act(obs)
 
-    # Should output something near current heading
     output_angle = math.atan2(float(action[1]), float(action[0]))
-    assert abs(output_angle - 0.5) < 1.0  # within noise margin
+    assert abs(output_angle - 0.5) < 1.0  # within wander + output noise margin
