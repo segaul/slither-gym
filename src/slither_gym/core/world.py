@@ -228,17 +228,23 @@ class World:
             for fx, fy, fv in corpse:
                 self._food.spawn_at(fx, fy, fv)
 
-        # 5. Collect food
+        # 5. Collect food — one batched pass (INFRA-batched-hotspots; bitwise = the
+        # per-snake collect_near loop, same snake order). A snake's grow() never moves
+        # another snake's head or radius within this stage, so the upfront gather is
+        # the same values the loop read one-at-a-time.
         remains_eaten: dict[int, float] = {sid: 0.0 for sid in alive_ids}
-        for sid in self._snakes.alive_ids():
+        collect_ids = self._snakes.alive_ids()
+        cxs, cys, crads = [], [], []
+        for sid in collect_ids:
             state = self._snakes.get_state(sid)
-            collect_radius = (
+            cxs.append(state.head_x)
+            cys.append(state.head_y)
+            crads.append(
                 state.segment_radius * config.collect_radius_mass_mult
                 + config.collect_radius_base
             )
-            collected, corpse_collected = self._food.collect_near(
-                state.head_x, state.head_y, collect_radius
-            )
+        collect_results = self._food.collect_near_batch(cxs, cys, crads)
+        for sid, (collected, corpse_collected) in zip(collect_ids, collect_results):
             if collected > 0:
                 # R3: pellet VALUE -> MASS conversion. Legacy is 1:1 (byte-
                 # identical); under growth_law="real" a unit of value is worth

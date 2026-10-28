@@ -1,4 +1,5 @@
 import math
+import os
 
 import numpy as np
 from numpy.typing import NDArray
@@ -9,6 +10,88 @@ from slither_gym.core.types import WorldConfig
 # radius), and every arithmetic result is independent of it. 256 keeps a
 # collect-radius query (~<100 u) at <=9 cells and a 500 u obs query at ~9-16.
 _FOOD_CELL = 256.0
+
+# INFRA-batched-hotspots (food half): per-snake food collection is ~48% of the env
+# step at 499 bots (NOTE-periter-cost-t11-vs-t22.md). One numba kernel runs the whole
+# per-tick collection pass — snakes IN ORDER against a working alive-mask (earlier
+# snakes remove pellets later snakes can never hit, exactly as the sequential loop) —
+# and returns the hit indices; the VALUE SUMS and all pool bookkeeping stay in the
+# Python wrapper so np.sum's pairwise summation and the free-list push order are the
+# byte-identical expressions collect_near always used. Distance test mirrors the
+# vectorized float32 arithmetic per NEP-50 (scalar operands cast to float32), the
+# same contract the T19 follow-chain kernel ships under.
+# Fallback order: numba missing or SLITHER_FOOD_KERNEL=python -> per-snake loop.
+FOOD_KERNEL = "python"
+_CELL_OFF = 1 << 20          # cell coords are ~tens at r=15000; off+21-bit packing
+_CELL_MUL = 1 << 21
+
+if os.environ.get("SLITHER_FOOD_KERNEL", "numba") != "python":
+    try:
+        from numba import njit
+
+        @njit(cache=True, fastmath=False)
+        def _collect_batch_numba(  # pragma: no cover - mirrored by tests
+            pos, work_alive, ucells, cell_start, cell_end, pellet_of,
+            xs, ys, radii, out_hits, out_off, scratch,
+        ):
+            cs = _FOOD_CELL
+            n_snakes = xs.shape[0]
+            n_ucells = ucells.shape[0]
+            ptr = 0
+            out_off[0] = 0
+            for s in range(n_snakes):
+                x = xs[s]
+                y = ys[s]
+                radius = radii[s]
+                # float64 bbox arithmetic, as _candidates does it
+                cx0 = int(math.floor((x - radius) / cs)) - 1
+                cx1 = int(math.floor((x + radius) / cs)) + 1
+                cy0 = int(math.floor((y - radius) / cs)) - 1
+                cy1 = int(math.floor((y + radius) / cs)) + 1
+                nc = 0
+                if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) >= n_ucells:
+                    for u in range(n_ucells):
+                        key = ucells[u]
+                        cx = key // _CELL_MUL - _CELL_OFF
+                        cy = key % _CELL_MUL - _CELL_OFF
+                        if cx0 <= cx <= cx1 and cy0 <= cy <= cy1:
+                            for k in range(cell_start[u], cell_end[u]):
+                                scratch[nc] = pellet_of[k]
+                                nc += 1
+                else:
+                    for cx in range(cx0, cx1 + 1):
+                        for cy in range(cy0, cy1 + 1):
+                            key = (cx + _CELL_OFF) * _CELL_MUL + (cy + _CELL_OFF)
+                            lo, hi = 0, n_ucells
+                            while lo < hi:
+                                mid = (lo + hi) // 2
+                                if ucells[mid] < key:
+                                    lo = mid + 1
+                                else:
+                                    hi = mid
+                            if lo < n_ucells and ucells[lo] == key:
+                                for k in range(cell_start[lo], cell_end[lo]):
+                                    scratch[nc] = pellet_of[k]
+                                    nc += 1
+                # ascending global order = the full-scan hit sequence
+                cand = np.sort(scratch[:nc])
+                x32 = np.float32(x)
+                y32 = np.float32(y)
+                r2 = np.float32(radius * radius)   # f64 square, THEN one f32 cast
+                for i in range(nc):
+                    c = cand[i]
+                    if work_alive[c]:
+                        dx = pos[c, 0] - x32
+                        dy = pos[c, 1] - y32
+                        if dx * dx + dy * dy < r2:
+                            work_alive[c] = False
+                            out_hits[ptr] = c
+                            ptr += 1
+                out_off[s + 1] = ptr
+
+        FOOD_KERNEL = "numba-collect-batch-v1"
+    except ImportError:  # numba genuinely absent -> reference loop
+        pass
 
 
 class FoodManager:
@@ -219,6 +302,65 @@ class FoodManager:
             self._grid_remove(i)
 
         return total, corpse
+
+    def collect_near_batch(
+        self, xs: list[float], ys: list[float], radii: list[float]
+    ) -> list[tuple[float, float]]:
+        """One tick's whole collection pass, snake order preserved: snake i's hits
+        exclude everything snakes <i already took, exactly as the sequential
+        collect_near loop. Bitwise contract: per-snake (total, corpse) and the final
+        pool state (alive mask, counts, free-list order, grid) are identical to
+        calling collect_near once per snake — enforced by
+        tests/test_collect_batch_kernel.py. Falls back to that loop when the numba
+        kernel is unavailable."""
+        if FOOD_KERNEL == "python" or self._count == 0:
+            return [self.collect_near(x, y, r) for x, y, r in zip(xs, ys, radii)]
+
+        idx = np.flatnonzero(self._alive)          # ascending global indices
+        p64 = self._positions[idx].astype(np.float64)
+        key = (
+            (np.floor(p64[:, 0] / _FOOD_CELL).astype(np.int64) + _CELL_OFF) * _CELL_MUL
+            + (np.floor(p64[:, 1] / _FOOD_CELL).astype(np.int64) + _CELL_OFF)
+        )
+        order = np.argsort(key, kind="stable")     # within a cell: idx ascending
+        keys_sorted = key[order]
+        pellet_of = idx[order]
+        starts = np.flatnonzero(
+            np.concatenate(([True], keys_sorted[1:] != keys_sorted[:-1]))
+        )
+        ucells = keys_sorted[starts]
+        ends = np.concatenate((starts[1:], [len(keys_sorted)]))
+
+        n = len(xs)
+        work_alive = self._alive.copy()
+        out_hits = np.empty(idx.size, dtype=np.int64)
+        out_off = np.empty(n + 1, dtype=np.int64)
+        scratch = np.empty(idx.size, dtype=np.int64)
+        _collect_batch_numba(
+            self._positions, work_alive, ucells, starts.astype(np.int64),
+            ends.astype(np.int64), pellet_of,
+            np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64),
+            np.asarray(radii, dtype=np.float64), out_hits, out_off, scratch,
+        )
+
+        results: list[tuple[float, float]] = []
+        for s in range(n):
+            hit_indices = out_hits[out_off[s]:out_off[s + 1]]
+            if hit_indices.size == 0:
+                results.append((0.0, 0.0))
+                continue
+            # identical expressions to collect_near's tail (same pairwise np.sum)
+            total = float(np.sum(self._values[hit_indices]))
+            corpse_indices = hit_indices[self._is_corpse[hit_indices]]
+            corpse = float(np.sum(self._values[corpse_indices]))
+            self._alive[hit_indices] = False
+            self._count -= len(hit_indices)
+            self._floor_count -= int(np.count_nonzero(~self._is_corpse[hit_indices]))
+            self._free.extend(hit_indices.tolist())
+            for i in hit_indices.tolist():
+                self._grid_remove(i)
+            results.append((total, corpse))
+        return results
 
     def alive_floor_count(self) -> int:
         """Alive NON-corpse pellets.
