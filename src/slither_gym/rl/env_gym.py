@@ -20,6 +20,7 @@ from slither_gym.rl.env_obs_v5 import (
     v5_initial_last_action,
     v5_observe,
 )
+from slither_gym.rl.bot_obs_kernel import BOT_OBS_KERNEL
 from slither_gym.rl.env_parallel import SlitherParallelEnv
 from slither_gym.rl.obs_processor import compute_observation
 from slither_gym.rl.reward import compute_reward
@@ -518,11 +519,68 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         # Inverse of snake.py: sct = initial_segments + (mass - initial_mass).
         return cfg.initial_mass + (sct - cfg.initial_segments)
 
+    def _shared_zero_obs(self) -> dict[str, NDArray[np.float32]]:
+        """The fast bot path never writes prey/danger/own_body/minimap — share ONE
+        read-only zero array per shape across all bots and ticks instead of allocating
+        ~500x4 fresh 16KB minimaps per step (BotPolicy only reads; writeable=False
+        turns any future violation into a loud error instead of cross-bot bleed)."""
+        cache = getattr(self, "_zero_obs_cache", None)
+        if cache is None:
+            oc = self._obs_config
+            cache = {}
+            for key, shape in (
+                ("prey", (oc.k_prey, oc.prey_features)),
+                ("danger_segments", (oc.k_danger_segments, oc.danger_features)),
+                ("own_body", (oc.k_own_body, oc.own_body_features)),
+                ("minimap", (oc.minimap_size, oc.minimap_size)),
+            ):
+                z = np.zeros(shape, dtype=np.float32)
+                z.flags.writeable = False
+                cache[key] = z
+            self._zero_obs_cache = cache
+        return cache
+
     def _update_bot_obs_cache(self) -> None:
         assert self._world is not None
         self._bot_obs_cache.clear()
         self._bot_obs_partial.clear()
         states = self._world.get_snake_states()
+        # One kernel call covers every scripted bot's enemy pass (bot_obs_kernel);
+        # each bot then slices its rows out of `enemy_rows`.
+        enemy_rows: NDArray[np.float32] | None = None
+        enemy_row_of: dict[int, int] = {}
+        if BOT_OBS_KERNEL != "python":
+            from slither_gym.rl.bot_obs_kernel import enemy_rows_numba
+            scripted = [
+                i for i in range(1, 1 + self._num_bots)
+                if i not in self._bot_policies
+                and (s := states.get(i)) is not None and s.alive
+            ]
+            if scripted:
+                oc = self._obs_config
+                order = list(states.keys())      # the reference loop's dict order
+                pos_of = {sid: k for k, sid in enumerate(order)}
+                n = len(order)
+                hx = np.fromiter((states[s].head_x for s in order), np.float64, n)
+                hy = np.fromiter((states[s].head_y for s in order), np.float64, n)
+                an = np.fromiter((states[s].angle for s in order), np.float64, n)
+                spd = np.fromiter((states[s].speed for s in order), np.float64, n)
+                ms = np.fromiter((states[s].mass for s in order), np.float64, n)
+                bo = np.fromiter((states[s].boosting for s in order), np.bool_, n)
+                sc = np.fromiter((states[s].segment_count for s in order), np.int64, n)
+                al = np.fromiter((states[s].alive for s in order), np.bool_, n)
+                bot_rows = np.fromiter((pos_of[i] for i in scripted), np.int64,
+                                       len(scripted))
+                enemy_rows = np.zeros(
+                    (len(scripted), oc.k_enemies, oc.enemy_features), dtype=np.float32)
+                cull_sq = (self._world_config.perception_radius + 300) ** 2
+                enemy_rows_numba(
+                    bot_rows, hx, hy, an, spd, ms, bo, sc, al,
+                    oc.k_enemies, cull_sq, 500.0, oc.speed_norm,
+                    np.empty(n, dtype=np.int64), np.empty(n, dtype=np.float64),
+                    enemy_rows,
+                )
+                enemy_row_of = {sid: b for b, sid in enumerate(scripted)}
         # Full agent-grade obs are only needed by policy-driven bots
         # (self-play / league). Scripted BotPolicy consumes exactly
         # self_state[2:5], enemies[:, {0,1,26,28,29,31}] and food[:, 0:3]
@@ -546,7 +604,9 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
                 self._bot_obs_cache[i] = compute_observation(raw, self._obs_config_for_bot(i))
             else:
                 self._bot_obs_cache[i] = self._compute_bot_observation_fast(
-                    i, bot_state, states
+                    i, bot_state, states,
+                    enemy_obs=(enemy_rows[enemy_row_of[i]]
+                               if enemy_rows is not None else None),
                 )
                 self._bot_obs_partial.add(i)
 
@@ -555,6 +615,7 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         snake_id: int,
         state: Any,
         all_states: dict[int, Any],
+        enemy_obs: NDArray[np.float32] | None = None,
     ) -> dict[str, NDArray[np.float32]]:
         """Scripted-BotPolicy observation (env-throughput batch, 2026-08-09).
 
@@ -620,45 +681,47 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
                 food_obs[:n_take, 2] = vals_in[order]
 
         # --- enemies, exact _compute_enemies replication minus body samples
-        # (cols 2-25 stay zero). Same cull, same stable distance sort.
-        enemy_obs = np.zeros((oc.k_enemies, oc.enemy_features), dtype=np.float32)
-        cull_sq = (self._world_config.perception_radius + 300) ** 2
-        nearby: list[Any] = []
-        for other_id, other in all_states.items():
-            if not other.alive or other_id == snake_id:
-                continue
-            if other.segment_count == 0:  # == len(get_segments(id)) == 0
-                continue
-            dx = other.head_x - state.head_x
-            dy = other.head_y - state.head_y
-            if dx * dx + dy * dy > cull_sq:
-                continue
-            nearby.append(other)
-        nearby.sort(
-            key=lambda s: math.hypot(s.head_x - state.head_x, s.head_y - state.head_y)
-        )
-        for slot in range(min(len(nearby), oc.k_enemies)):
-            s = nearby[slot]
-            row = enemy_obs[slot]
-            row[0] = (s.head_x - state.head_x) / perception_radius
-            row[1] = (s.head_y - state.head_y) / perception_radius
-            row[26] = math.log(max(s.mass, 1.0) / initial_mass)
-            row[27] = s.speed / oc.speed_norm
-            row[28] = math.cos(s.angle)
-            row[29] = math.sin(s.angle)
-            row[30] = 1.0 if s.boosting else 0.0
-            row[31] = 1.0
+        # (cols 2-25 stay zero). Same cull, same stable distance sort. When the
+        # bot_obs_kernel ran (enemy_obs given), its rows ARE this loop's output
+        # (bitwise; tests/test_bot_obs_kernel.py) — skip the per-bot pass.
+        if enemy_obs is None:
+            enemy_obs = np.zeros((oc.k_enemies, oc.enemy_features), dtype=np.float32)
+            cull_sq = (self._world_config.perception_radius + 300) ** 2
+            nearby: list[Any] = []
+            for other_id, other in all_states.items():
+                if not other.alive or other_id == snake_id:
+                    continue
+                if other.segment_count == 0:  # == len(get_segments(id)) == 0
+                    continue
+                dx = other.head_x - state.head_x
+                dy = other.head_y - state.head_y
+                if dx * dx + dy * dy > cull_sq:
+                    continue
+                nearby.append(other)
+            nearby.sort(
+                key=lambda s: math.hypot(s.head_x - state.head_x, s.head_y - state.head_y)
+            )
+            for slot in range(min(len(nearby), oc.k_enemies)):
+                s = nearby[slot]
+                row = enemy_obs[slot]
+                row[0] = (s.head_x - state.head_x) / perception_radius
+                row[1] = (s.head_y - state.head_y) / perception_radius
+                row[26] = math.log(max(s.mass, 1.0) / initial_mass)
+                row[27] = s.speed / oc.speed_norm
+                row[28] = math.cos(s.angle)
+                row[29] = math.sin(s.angle)
+                row[30] = 1.0 if s.boosting else 0.0
+                row[31] = 1.0
 
+        zeros = self._shared_zero_obs()
         return {
             "self_state": self_state,
             "food": food_obs,
-            "prey": np.zeros((oc.k_prey, oc.prey_features), dtype=np.float32),
+            "prey": zeros["prey"],
             "enemies": enemy_obs,
-            "danger_segments": np.zeros(
-                (oc.k_danger_segments, oc.danger_features), dtype=np.float32
-            ),
-            "own_body": np.zeros((oc.k_own_body, oc.own_body_features), dtype=np.float32),
-            "minimap": np.zeros((oc.minimap_size, oc.minimap_size), dtype=np.float32),
+            "danger_segments": zeros["danger_segments"],
+            "own_body": zeros["own_body"],
+            "minimap": zeros["minimap"],
         }
 
     def _obs_config_for_bot(self, i: int) -> ObsConfig:
