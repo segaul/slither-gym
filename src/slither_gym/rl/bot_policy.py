@@ -42,7 +42,8 @@ class BotPolicy:
             # Curriculum prey personality (E12 default "kamikaze"; E11 used "careless").
             self._personality: str = str(getattr(config, "curriculum_prey", "kamikaze"))
         else:
-            self._personality = str(rng.choice(self.PERSONALITIES, p=self.WEIGHTS))
+            w = getattr(config, "bot_personality_weights", None) or self.WEIGHTS
+            self._personality = str(rng.choice(self.PERSONALITIES, p=list(w)))
         self._wander_angle: float = float(rng.uniform(0, 2 * math.pi))
 
     def act(self, obs: dict[str, NDArray[np.float32]], **kwargs: Any) -> NDArray[np.float32]:

@@ -48,6 +48,10 @@ class WorldConfig:
     # (byte-identical to pre-E11, and what the eval always uses). Below 1.0, prob (1-difficulty)
     # of each bot being the `curriculum_prey` personality. Only matters when difficulty < 1.0.
     bot_difficulty: float = 1.0
+    # T22: training-opponent personality mix override (food_seeker, opportunist,
+    # circler, escaper). None = BotPolicy's legacy class WEIGHTS — every eval and every
+    # prior run is byte-identical by default.
+    bot_personality_weights: tuple | None = None
     # Which exploitable personality the curriculum injects. E11 used "careless" (passive, REFUTED —
     # never collided). E12 default "kamikaze" (charges the nearest snake's body → forces the
     # collisions/kills the agent must sample). "careless" preserved for E11 reproducibility.
