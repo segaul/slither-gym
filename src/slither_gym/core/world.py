@@ -273,6 +273,9 @@ class World:
 
         # 6. Batch-spawn food
         self._tick += 1
+        self._food.now_tick = self._tick
+        if config.corpse_ttl_ticks is not None and self._tick % config.food_refresh_interval == 0:
+            self._food.expire_corpses(config.corpse_ttl_ticks)
         if self._tick % config.food_refresh_interval == 0:
             target = self._target_food_count()
             if target is None:

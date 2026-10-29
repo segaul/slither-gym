@@ -249,6 +249,11 @@ class WorldConfig:
     #   conserved exactly. Inert unless corpse_value_law == "real".
     corpse_value_law: str = "legacy"
     corpse_mass_multiplier: float = 20.0
+    # T28 amendment: corpse CONTENTION proxy — live corpses are eaten by competitors in
+    # seconds; sim corpses persist uncontested (measured: 99.8% of first-60s intake).
+    # Pellets of corpse origin despawn corpse_ttl_ticks after spawn. None = legacy
+    # (byte-identical: the expiry path never runs).
+    corpse_ttl_ticks: int | None = None
     corpse_pellet_value_target: float = 12.1
 
     # --- R3: growth law (pellet value -> mass -> segments) ---

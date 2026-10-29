@@ -128,6 +128,9 @@ class FoodManager:
         # suppresses floor spawning until the corpse is eaten.
         self._floor_count: int = 0
         self._free: list[int] = list(range(config.max_food))
+        # T28: corpse TTL support — world.step keeps now_tick current; spawn_at stamps it.
+        self.now_tick: int = 0
+        self._spawn_tick = np.zeros(config.max_food, dtype=np.int64)
         # Cell grid over ALIVE pellets: (cx, cy) -> set of pellet indices.
         # Sets are fine (unordered): every consumer sorts candidates ascending.
         self._grid: dict[tuple[int, int], set[int]] = {}
@@ -256,6 +259,7 @@ class FoodManager:
         self._count += 1
         if not corpse:
             self._floor_count += 1
+        self._spawn_tick[idx] = self.now_tick
         self._grid_add(idx)
 
     def collect_near(self, x: float, y: float, radius: float) -> tuple[float, float]:
@@ -361,6 +365,18 @@ class FoodManager:
                 self._grid_remove(i)
             results.append((total, corpse))
         return results
+
+    def expire_corpses(self, ttl_ticks: int) -> int:
+        """T28 contention proxy: despawn corpse pellets older than ttl_ticks.
+        Returns the number expired. Floor pellets are never touched."""
+        idx = np.flatnonzero(self._alive & self._is_corpse
+                             & (self.now_tick - self._spawn_tick > ttl_ticks))
+        for i in idx.tolist():
+            self._alive[i] = False
+            self._count -= 1
+            self._free.append(i)
+            self._grid_remove(i)
+        return int(idx.size)
 
     def alive_floor_count(self) -> int:
         """Alive NON-corpse pellets.
