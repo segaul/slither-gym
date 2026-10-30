@@ -144,6 +144,12 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             )
         self._prev_edge_phi: float = 0.0
         # T16 (DRAFT): obstruction potential Φ(s) ≤ 0 from the previous RL step.
+        if world_config.cutoff_shaping not in ("off", "potential"):
+            raise ValueError(
+                f"unknown cutoff_shaping {world_config.cutoff_shaping!r} "
+                "(expected 'off' or 'potential')"
+            )
+        self._prev_cutoff_phi: float = 0.0
         if world_config.body_shaping not in ("off", "potential"):
             raise ValueError(
                 f"unknown body_shaping {world_config.body_shaping!r} "
@@ -235,7 +241,43 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             if self._world_config.body_shaping == "potential"
             else 0.0
         )
+        # T35: seed the cut-off hazard potential the same way.
+        self._prev_cutoff_phi = (
+            self._compute_cutoff_potential()
+            if self._world_config.cutoff_shaping == "potential"
+            else 0.0
+        )
         return rl_obs, {}
+
+    def _compute_cutoff_potential(self) -> float:
+        """T35 cut-off hazard Φ(s) ∈ [−coef, 0] — STATE-ONLY: the worst enemy that is
+        BOOSTING (ground-truth SnakeState.boosting), has its head within
+        cutoff_shaping_width of ours, sits AHEAD of our heading (±60°), and is CLOSING
+        (its heading within ±60° of the bearing toward us). Φ = −coef·(1 − d/width) for
+        that enemy; 0 when no such enemy exists."""
+        world = self._world
+        if world is None:
+            return 0.0
+        states = world.get_snake_states()
+        me = states.get(0)
+        if me is None or not me.alive:
+            return 0.0
+        cfg = self._world_config
+        worst = 0.0
+        for sid, s in states.items():
+            if sid == 0 or not s.alive or not s.boosting:
+                continue
+            dx, dy = s.head_x - me.head_x, s.head_y - me.head_y
+            d = math.hypot(dx, dy)
+            if d >= cfg.cutoff_shaping_width or d <= 0.0:
+                continue
+            bearing = math.atan2(dy, dx)
+            if math.cos(bearing - me.angle) <= 0.5:      # not ahead of us (±60°)
+                continue
+            if math.cos(s.angle - (bearing + math.pi)) <= 0.5:  # not closing on us
+                continue
+            worst = max(worst, 1.0 - d / cfg.cutoff_shaping_width)
+        return -cfg.cutoff_shaping_coef * worst
 
     def _compute_body_potential(self) -> float:
         """T16 obstruction potential Φ(s) ∈ [−k, 0] — STATE-ONLY: distance from MY head to
@@ -434,6 +476,13 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             body_phi_next = 0.0 if terminated else self._compute_body_potential()
             total_reward += config.body_shaping_gamma * body_phi_next - self._prev_body_phi
             self._prev_body_phi = body_phi_next
+
+        # T35: cut-off hazard potential, same contract (ONCE per RL step; Φ(terminal)=0;
+        # Φ kept at truncation — Pardo).
+        if config.cutoff_shaping == "potential":
+            cut_phi_next = 0.0 if terminated else self._compute_cutoff_potential()
+            total_reward += config.cutoff_shaping_gamma * cut_phi_next - self._prev_cutoff_phi
+            self._prev_cutoff_phi = cut_phi_next
 
         if self._respawn_bots:
             for i in range(1, 1 + self._num_bots):

@@ -95,6 +95,15 @@ class WorldConfig:
     body_shaping_coef: float = 2.0
     body_shaping_gamma: float = 0.997  # must equal the trainer's RL γ
 
+    # T35 cut-off hazard potential (PROPOSAL-T35): Φ(s) ∈ [−coef, 0] prices the worst
+    # BOOSTING enemy whose head is near, ahead of us (±60°), and closing. Ground-truth
+    # env state (SnakeState.boosting), not obs. "off" default = byte-identical legacy;
+    # same γΦ(s′)−Φ(s) telescoping, terminal Φ=0, Φ kept at truncation (Pardo).
+    cutoff_shaping: str = "off"
+    cutoff_shaping_width: float = 600.0  # u; within the 500u obs perception + margin
+    cutoff_shaping_coef: float = 1.0
+    cutoff_shaping_gamma: float = 0.997  # must equal the trainer's RL γ
+
     # --- Corpse/floor food accounting. Both default to the LEGACY behaviour so
     # E9-E30 and frozen_eval_v1..v7 stay byte-identical. ---
     # StepResult.remains_eaten has always been documented as "mass gained from corpse
