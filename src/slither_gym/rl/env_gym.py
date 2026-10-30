@@ -125,6 +125,9 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
 
         self._snake_cache = SnakeCache(max_slots=obs_config.k_enemies)
         self._bot_obs_cache: dict[int, dict[str, NDArray[np.float32]]] = {}
+        # T34: per-bot last COMMANDED action for v5-obs policy bots (self_state[7]/[9:12]
+        # feedback, mirroring _last_commanded_rl). Missing entry -> spawn-heading default.
+        self._bot_last_action: dict[int, LastAction] = {}
         # Bots whose cached obs is the scripted-BotPolicy PARTIAL build (only
         # the fields BotPolicy consumes; see _compute_bot_observation_fast).
         # Policy-driven bots must never be fed one of these.
@@ -212,6 +215,7 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
         # S5: last-commanded seeds with the spawn heading / no boost, exactly
         # like the delay queue.
         self._last_commanded_rl = v5_initial_last_action(spawn_angle)
+        self._bot_last_action.clear()  # T34: fresh world, fresh spawn-heading defaults
 
         rl_obs = self._get_rl_observation()
         self._update_bot_obs_cache()
@@ -370,6 +374,12 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
                 for i in ids:
                     a = policy.act(self._bot_obs_cache[i], snake_id=i)
                     bot_actions[i] = (float(a[0]), float(a[1]), bool(a[2] > 0.5))
+        # T34: record v5-obs policy bots' COMMANDED actions for next step's self_state
+        # feedback (the v5 analogue of _last_commanded_rl). V4/scripted bots unaffected.
+        for i, pol in self._bot_policies.items():
+            if getattr(pol, "wants_v5_obs", False) and i in bot_actions:
+                ca, sa, bo = bot_actions[i]
+                self._bot_last_action[i] = (ca, sa, 1.0 if bo else 0.0)
 
         total_reward = 0.0
         terminated = False
@@ -438,6 +448,9 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
                     # Reset stateful policies on respawn
                     if i in self._bot_policies and hasattr(self._bot_policies[i], 'reset'):
                         self._bot_policies[i].reset(i)
+                    # T34: drop the stale last-action so the v5 obs falls back to the
+                    # spawn-heading default (v5_initial_last_action) next cache update.
+                    self._bot_last_action.pop(i, None)
 
         if terminated:
             rl_obs = self._empty_obs()
@@ -598,6 +611,17 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
             if bot_state is None or not bot_state.alive:
                 continue
             if i in self._bot_policies:
+                if self._obs_schema == "v5" and getattr(
+                    self._bot_policies[i], "wants_v5_obs", False
+                ):
+                    # T34: V5 opponents see the agent's own obs schema.
+                    self._bot_obs_cache[i] = v5_observe(
+                        self._world, i, self._obs_config_v5,
+                        self._bot_last_action.get(
+                            i, v5_initial_last_action(bot_state.angle)
+                        ),
+                    )
+                    continue
                 raw = self._build_raw_state(
                     i, bot_state, states, food_pos, food_vals, food_corpse
                 )
@@ -863,12 +887,22 @@ class SlitherGymEnv(gymnasium.Env):  # type: ignore[type-arg]
                 bot_state = states.get(i)
                 if bot_state is None or not bot_state.alive:
                     continue
-                raw = self._build_raw_state(
-                    i, bot_state, states, food_pos, food_vals, food_corpse
-                )
-                self._bot_obs_cache[i] = compute_observation(
-                    raw, self._obs_config_for_bot(i)
-                )
+                if self._obs_schema == "v5" and getattr(
+                    self._bot_policies.get(i), "wants_v5_obs", False
+                ):
+                    self._bot_obs_cache[i] = v5_observe(
+                        self._world, i, self._obs_config_v5,
+                        self._bot_last_action.get(
+                            i, v5_initial_last_action(bot_state.angle)
+                        ),
+                    )
+                else:
+                    raw = self._build_raw_state(
+                        i, bot_state, states, food_pos, food_vals, food_corpse
+                    )
+                    self._bot_obs_cache[i] = compute_observation(
+                        raw, self._obs_config_for_bot(i)
+                    )
                 self._bot_obs_partial.discard(i)
 
     def _empty_obs(self) -> dict[str, NDArray[np.float32]]:
